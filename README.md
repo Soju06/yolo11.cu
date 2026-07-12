@@ -13,13 +13,18 @@ YOLO11 n/s/m 스케일 지원 (익스포터가 모델 구조를 자동 유도), 
 |---|---|---|
 | ultralytics predict 전체 파이프라인 | 14.9 ms | 11.3 ms |
 | PyTorch fp16 eager, net만 (cuDNN) | 6.26 ms | 9.57 ms |
-| **이 엔진 bench** | **0.99 ms** (1014 fps) | **4.10 ms** (244 fps) |
-| 〃 + `ACC16=1` | 0.94 ms | 3.80 ms (263 fps) |
-| **이 엔진 pipeline (엔드투엔드)** | **1.23 ms** (812 fps) | 4.33 ms (231 fps) |
+| **이 엔진 bench** (기본: 하이브리드 누산) | **0.97 ms** (1031 fps) | **3.92 ms** (255 fps) |
+| 〃 `ACC16=1` (순수 fp16 누산) | 0.94 ms | 3.80 ms (264 fps) |
+| 〃 `ACC32=1` (순수 fp32 누산) | 0.98 ms | 4.11 ms |
+| **이 엔진 pipeline (엔드투엔드)** | **1.23 ms** (813 fps) | 4.14 ms (242 fps) |
 
-정확도: PyTorch fp32 대비 op 단위 최대 상대오차 n **0.45%** / m **1.4%** (fp16 고유 오차),
-bus.jpg / zidane.jpg 검출이 ultralytics와 박스·클래스·점수 일치.
-`ACC16=1`(fp16 mma 누산)은 오차가 n 1.9% / m 3.0%로 늘지만 검출 결과는 동일 — 옵트인.
+정확도(PyTorch fp32 대비 op 단위 최대 상대오차): 기본 하이브리드 n **0.99%** / m **1.3%**,
+`ACC32` n 0.45% / m 1.4%, `ACC16` n 1.9% / m 3.0%. 모든 모드에서 bus.jpg / zidane.jpg 검출이
+ultralytics와 박스·클래스·점수 일치.
+
+누산 모드: GA10x는 fp32-누산 HMMA가 fp16-누산의 절반 속도라(ncu: math_pipe_throttle 33%),
+기본값은 **하이브리드** — fp16 mma로 K=64 윈도우(2 kstep)만 누산하고 fp32 레지스터로 플러시.
+순수 fp16 속도의 대부분을 얻으면서 오차는 윈도우 크기로 바운드됩니다.
 
 ## 빠른 시작
 
@@ -65,11 +70,17 @@ ACC16=1 ./yolo11cuda bench build/yolo11m              # fp16 누산 모드
 
 - ncu SpeedOfLight: 큰 conv는 **Compute 37% / Memory 78-83%** — L2 대역폭 바운드.
   원인은 im2col A-타일이 n-블록 수만큼 재읽히는 것 → 넓은 N 타일(64,128)로 완화.
+- (64,128) 적용 후 재측정한 워프 스톨: math_pipe_throttle 33% / barrier 20% / wait 20% /
+  long_scoreboard(글로벌 메모리) **1.7%** — 더 이상 메모리 바운드가 아님. 이 데이터로
+  space-to-depth(s2 섹터 낭비 해소)는 무의미해져 착수 전에 기각.
 - 시도 후 기각(측정 근거): ① 2-패스 explicit im2col — dense A(29MB)가 L2(4MB)를 넘어 DRAM
-  왕복이 되며 역효과. ② (64,256)·STAGES=2 — 1×1 conv에서 얕은 파이프라인으로 2.3배 손해.
-  ③ `cp.async.ca`(L1 캐싱) — smem이 L1 파티션을 잠식해 무효과.
-- 남은 여지: stride-2 conv의 32B 섹터 반낭비(m의 ~20%)는 공간-깊이 변환 or halo-타일
-  직접 conv가 필요. Hopper+ 타깃이면 TMA/wgmma로 로더 재작성 여지.
+  왕복이 되며 역효과(4.08→4.31ms). ② (64,256)·STAGES=2 — 1×1 conv에서 얕은 파이프라인으로
+  2.3배 손해. ③ `cp.async.ca`(L1 캐싱) — smem이 L1 파티션을 잠식해 무효과.
+  ④ mbarrier 기반 `cuda::pipeline`(arrive/wait 분리로 barrier 스톨 제거 시도) — 스테이지당
+  mbarrier 왕복 오버헤드가 절감보다 커서 역효과(n 0.99→1.11ms, m 4.10→4.75ms).
+- 남은 여지: barrier+wait 스톨 40%는 커널 구조상 kstep 동기화 비용 — STAGES=5 페어링은
+  smem 증가로 occupancy가 반토막이라 손해(분석상). Hopper+ 타깃이면 TMA + wgmma(async mma)로
+  로더·동기화 재작성이 정답.
 
 ## 레이아웃
 

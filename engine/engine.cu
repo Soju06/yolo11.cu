@@ -153,7 +153,9 @@ __device__ __forceinline__ int swz(int row, int seg) {  // seg: which vec8 (0..3
 
 // Dense-K implicit GEMM: the GEMM K axis is the flat (ky,kx,ci) index with NO per-tap
 // padding — vec8 slots individually resolve (ky,kx,ci) so Cin=8/16 layers waste nothing.
-template<int BM, int BN, int STAGES, bool KONE = false, bool ACC16 = false,
+// AMODE: 0 = fp32 mma accumulate, 1 = pure fp16 accumulate (fastest, ~2-3% err),
+//         2 = hybrid: fp16 mma over a 4-kstep (K=128) window, flushed into fp32
+template<int BM, int BN, int STAGES, bool KONE = false, int AMODE = 0,
          int WARPS_M = 2, int WARPS_N = 2>
 __global__ void __launch_bounds__(WARPS_M * WARPS_N * 32, 2) k_conv_mma(
     const __half* __restrict__ X, int H, int W, int xs, int xo,
@@ -294,7 +296,7 @@ __global__ void __launch_bounds__(WARPS_M * WARPS_N * 32, 2) k_conv_mma(
       for (int mi = 0; mi < MI; mi++)
 #pragma unroll
         for (int ni = 0; ni < NI; ni++) {
-          if (ACC16)
+          if (AMODE >= 1)
             asm volatile(
                 "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 "
                 "{%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%0,%1};\n"
@@ -310,8 +312,21 @@ __global__ void __launch_bounds__(WARPS_M * WARPS_N * 32, 2) k_conv_mma(
                   "r"(b[ni][0]), "r"(b[ni][1]));
         }
     }
+    if (AMODE == 2 && ((ks & 1) == 1 || ks == ksteps - 1)) {
+      // flush the bounded fp16 window into fp32 accumulators
+#pragma unroll
+      for (int mi = 0; mi < MI; mi++)
+#pragma unroll
+        for (int ni = 0; ni < NI; ni++) {
+          float2 lo = __half22float2(*(__half2*)&hacc[mi][ni][0]);
+          float2 hi = __half22float2(*(__half2*)&hacc[mi][ni][1]);
+          acc[mi][ni][0] += lo.x; acc[mi][ni][1] += lo.y;
+          acc[mi][ni][2] += hi.x; acc[mi][ni][3] += hi.y;
+          hacc[mi][ni][0] = hacc[mi][ni][1] = 0u;
+        }
+    }
   }
-  if (ACC16) {   // unpack fp16 accumulators into the float epilogue path
+  if (AMODE == 1) {   // unpack fp16 accumulators into the float epilogue path
 #pragma unroll
     for (int mi = 0; mi < MI; mi++)
 #pragma unroll
@@ -975,15 +990,17 @@ static void runOp(Net& net, const Op& op, cudaStream_t st) {
               hasRes ? r.p : nullptr, hasRes ? r.s : 0, hasRes ? r.o : 0,
               op.Cin, op.Cout, op.k, op.s, op.p, op.act);
         };
-        static const bool acc16 = getenv("ACC16") != nullptr;
+        static const int amode = getenv("ACC16") ? 1 : (getenv("ACC32") ? 0 : 2);
 #define LAUNCH_TILE(BM_, BN_, ST_, WM_, WN_)                                                     \
         do {                                                                                     \
           if (kone) {                                                                            \
-            if (acc16) launch(k_conv_mma<BM_, BN_, ST_, true, true, WM_, WN_>, BM_, BN_, WM_ * WN_ * 32);  \
-            else       launch(k_conv_mma<BM_, BN_, ST_, true, false, WM_, WN_>, BM_, BN_, WM_ * WN_ * 32); \
+            if (amode == 1)      launch(k_conv_mma<BM_, BN_, ST_, true, 1, WM_, WN_>, BM_, BN_, WM_ * WN_ * 32); \
+            else if (amode == 0) launch(k_conv_mma<BM_, BN_, ST_, true, 0, WM_, WN_>, BM_, BN_, WM_ * WN_ * 32); \
+            else                 launch(k_conv_mma<BM_, BN_, ST_, true, 2, WM_, WN_>, BM_, BN_, WM_ * WN_ * 32); \
           } else {                                                                               \
-            if (acc16) launch(k_conv_mma<BM_, BN_, ST_, false, true, WM_, WN_>, BM_, BN_, WM_ * WN_ * 32); \
-            else       launch(k_conv_mma<BM_, BN_, ST_, false, false, WM_, WN_>, BM_, BN_, WM_ * WN_ * 32);\
+            if (amode == 1)      launch(k_conv_mma<BM_, BN_, ST_, false, 1, WM_, WN_>, BM_, BN_, WM_ * WN_ * 32); \
+            else if (amode == 0) launch(k_conv_mma<BM_, BN_, ST_, false, 0, WM_, WN_>, BM_, BN_, WM_ * WN_ * 32); \
+            else                 launch(k_conv_mma<BM_, BN_, ST_, false, 2, WM_, WN_>, BM_, BN_, WM_ * WN_ * 32); \
           }                                                                                      \
         } while (0)
         // wide-N tiles only where A (im2col) re-reads dominate: 3x3 with big M and wide Cout.
@@ -1161,7 +1178,8 @@ static void usage() {
          "  profile   per-op timing breakdown\n"
          "  dump      write per-op outputs for test/compare.py\n\n"
          "model-dir defaults to build/yolo11n (create with: make export MODEL=yolo11n)\n"
-         "env: ACC16=1 -> fp16 mma accumulation (faster, slightly lower precision)\n");
+         "env: ACC16=1 -> pure fp16 mma accumulation (fastest, ~2-3%% err)\n"
+         "     ACC32=1 -> pure fp32 accumulation (exact-est). default: hybrid K=64 window\n");
 }
 
 // ------------------------- main -------------------------
