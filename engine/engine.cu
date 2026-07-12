@@ -461,98 +461,6 @@ __global__ void k_dwconv8(const __half* __restrict__ X, int H, int W, int xs, in
   *(uint4*)(Y + (size_t)pix * ys + yo + c) = *(uint4*)out;
 }
 
-// attention v3: two-kernel scheme.
-// Kernel 1: P[h][q][j] = softmax_j(Q.K^T * scale) for a 64-query tile (K in smem, conflict-free pad).
-// Kernel 2: out[q][h*hd+c] = sum_j P[h][q][j] * V[j][c] (V in smem).
-#define AQT 32  // query tile
-__global__ void k_attn_qk(const __half* __restrict__ QKV, int qs, int qo,
-                          __half* __restrict__ P, int N, int kd, int hd) {
-  extern __shared__ __half smq[];
-  const int KP = 34;                    // padded row (conflict-free: 17 words, odd)
-  __half* Ks = smq;                     // [N][KP]
-  __half* Qs = smq + N * KP;            // [AQT][KP]
-  __half* Ps = Qs + AQT * KP;           // [AQT][N] raw scores then probs
-  const int h = blockIdx.y, per = 2 * kd + hd;
-  const int q0 = blockIdx.x * AQT;
-  const int nq = min(AQT, N - q0);
-  for (int i = threadIdx.x; i < N * (kd / 2); i += blockDim.x) {
-    int tok = i / (kd / 2), s = i % (kd / 2);
-    *(__half2*)&Ks[tok * KP + s * 2] = *(const __half2*)(QKV + (size_t)tok * qs + qo + h * per + kd + s * 2);
-  }
-  for (int i = threadIdx.x; i < nq * (kd / 2); i += blockDim.x) {
-    int q = i / (kd / 2), s = i % (kd / 2);
-    *(__half2*)&Qs[q * KP + s * 2] = *(const __half2*)(QKV + (size_t)(q0 + q) * qs + qo + h * per + s * 2);
-  }
-  __syncthreads();
-  const float scale = rsqrtf((float)kd);
-  for (int e = threadIdx.x; e < nq * N; e += blockDim.x) {
-    int q = e / N, j = e % N;
-    const __half2* qp = (const __half2*)&Qs[q * KP];
-    const __half2* kp = (const __half2*)&Ks[j * KP];
-    float s = 0;
-#pragma unroll
-    for (int d = 0; d < 16; d++) {
-      float2 a = __half22float2(qp[d]), b = __half22float2(kp[d]);
-      s += a.x * b.x + a.y * b.y;
-    }
-    Ps[q * N + j] = __float2half(s * scale);
-  }
-  __syncthreads();
-  // softmax per row: warp per row
-  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-  for (int q = warp; q < nq; q += blockDim.x >> 5) {
-    float lmax = -1e30f;
-    for (int j = lane; j < N; j += 32) lmax = fmaxf(lmax, __half2float(Ps[q * N + j]));
-#pragma unroll
-    for (int o = 16; o > 0; o >>= 1) lmax = fmaxf(lmax, __shfl_xor_sync(~0u, lmax, o));
-    float lsum = 0;
-    for (int j = lane; j < N; j += 32) lsum += __expf(__half2float(Ps[q * N + j]) - lmax);
-#pragma unroll
-    for (int o = 16; o > 0; o >>= 1) lsum += __shfl_xor_sync(~0u, lsum, o);
-    float inv = 1.f / lsum;
-    for (int j = lane; j < N; j += 32) {
-      float p = __expf(__half2float(Ps[q * N + j]) - lmax) * inv;
-      P[((size_t)h * N + (q0 + q)) * N + j] = __float2half(p);
-    }
-  }
-}
-
-__global__ void k_attn_av(const __half* __restrict__ QKV, int qs, int qo,
-                          const __half* __restrict__ P,
-                          __half* __restrict__ Y, int ys, int yo,
-                          int N, int kd, int hd) {
-  extern __shared__ __half smv[];
-  const int VP = 66;                    // padded V row
-  __half* Vs = smv;                     // [N][VP]
-  const int h = blockIdx.y, per = 2 * kd + hd;
-  const int q0 = blockIdx.x * AQT;
-  const int nq = min(AQT, N - q0);
-  const int Npad = (N + 31) & ~31;
-  for (int i = threadIdx.x; i < Npad * (hd / 2); i += blockDim.x) {
-    int tok = i / (hd / 2), s = i % (hd / 2);
-    *(__half2*)&Vs[tok * VP + s * 2] = tok < N
-        ? *(const __half2*)(QKV + (size_t)tok * qs + qo + h * per + 2 * kd + s * 2)
-        : __floats2half2_rn(0.f, 0.f);
-  }
-  __syncthreads();
-  // warp per query; lanes span 64 channels; P row loaded coalesced + shfl-broadcast
-  const int lane = threadIdx.x & 31, qslot = threadIdx.x >> 5;
-  for (int q = qslot; q < nq; q += blockDim.x >> 5) {
-    const __half* prow = P + ((size_t)h * N + (q0 + q)) * N;
-    float a0 = 0, a1 = 0;
-    for (int j0 = 0; j0 < N; j0 += 32) {
-      float pl = (j0 + lane < N) ? __half2float(prow[j0 + lane]) : 0.f;
-#pragma unroll
-      for (int jj = 0; jj < 32; jj++) {
-        float p = __shfl_sync(~0u, pl, jj);
-        float2 v = __half22float2(*(const __half2*)&Vs[(j0 + jj) * VP + lane * 2]);
-        a0 += p * v.x; a1 += p * v.y;
-      }
-    }
-    *(__half2*)(Y + (size_t)(q0 + q) * ys + yo + h * hd + lane * 2) = __floats2half2_rn(a0, a1);
-  }
-}
-
 // row-wise softmax(x * scale) in place; one warp per row
 __global__ void k_softmax_rows(__half* __restrict__ P, int rows, int N, float scale) {
   int row = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
@@ -579,72 +487,6 @@ __global__ void k_vtrans(const __half* __restrict__ QKV, int qs, int qo,
   if (idx >= heads * hd * N) return;
   int tok = idx % N, c = (idx / N) % hd, h = idx / (N * hd);
   VT[idx] = QKV[(size_t)tok * qs + qo + h * (2 * kd + hd) + 2 * kd + c];
-}
-
-// attention v2: K/V resident in shared memory, one block per (query-chunk, head).
-// qkv layout per token: [h0: q(kd) k(kd) v(hd) | h1: ...], N tokens, stride qs.
-#define ATTN_Q 50
-__global__ void k_attn2(const __half* __restrict__ QKV, int qs, int qo,
-                        __half* __restrict__ Y, int ys, int yo,
-                        int N, int kd, int hd) {
-  extern __shared__ __half smh[];
-  __half* Ks = smh;                      // [N][kd]
-  __half* Vs = smh + N * kd;             // [N][hd]
-  float* probs = (float*)(Vs + N * hd);  // [8 warps][N]
-  float* qsm = probs + 8 * N;            // [8 warps][kd]
-  const int h = blockIdx.y, per = 2 * kd + hd;
-  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-  const float scale = rsqrtf((float)kd);
-  for (int i = threadIdx.x; i < N * (kd + hd) / 8; i += blockDim.x) {
-    // i indexes vec8 slots: first N*kd/8 are K, rest V
-    int kslots = N * kd / 8;
-    if (i < kslots) {
-      int tok = i / (kd / 8), s = i % (kd / 8);
-      *(uint4*)&Ks[tok * kd + s * 8] = *(const uint4*)(QKV + (size_t)tok * qs + qo + h * per + kd + s * 8);
-    } else {
-      int j = i - kslots;
-      int tok = j / (hd / 8), s = j % (hd / 8);
-      *(uint4*)&Vs[tok * hd + s * 8] = *(const uint4*)(QKV + (size_t)tok * qs + qo + h * per + 2 * kd + s * 8);
-    }
-  }
-  __syncthreads();
-  int q0 = blockIdx.x * ATTN_Q;
-  for (int q = q0 + warp; q < min(q0 + ATTN_Q, N); q += 8) {
-    // load q into per-warp smem
-    for (int d = lane; d < kd; d += 32) qsm[warp * kd + d] = __half2float(QKV[(size_t)q * qs + qo + h * per + d]);
-    __syncwarp();
-    // scores: lane handles tokens lane, lane+32, ...
-    float lmax = -1e30f;
-    for (int j = lane; j < N; j += 32) {
-      float s = 0;
-      const __half* kp = Ks + (size_t)j * kd;
-#pragma unroll
-      for (int d = 0; d < 32; d++) s += qsm[warp * kd + d] * __half2float(kp[d]);
-      s *= scale;
-      probs[warp * N + j] = s;
-      lmax = fmaxf(lmax, s);
-    }
-#pragma unroll
-    for (int o = 16; o > 0; o >>= 1) lmax = fmaxf(lmax, __shfl_xor_sync(~0u, lmax, o));
-    float lsum = 0;
-    for (int j = lane; j < N; j += 32) {
-      float e = __expf(probs[warp * N + j] - lmax);
-      probs[warp * N + j] = e; lsum += e;
-    }
-#pragma unroll
-    for (int o = 16; o > 0; o >>= 1) lsum += __shfl_xor_sync(~0u, lsum, o);
-    float inv = 1.f / lsum;
-    __syncwarp();
-    // output: lane covers channels lane, lane+32
-    float a0 = 0, a1 = 0;
-    for (int j = 0; j < N; j++) {
-      float p = probs[warp * N + j];
-      a0 += p * __half2float(Vs[(size_t)j * hd + lane]);
-      a1 += p * __half2float(Vs[(size_t)j * hd + lane + 32]);
-    }
-    Y[(size_t)q * ys + yo + h * hd + lane] = __float2half(a0 * inv);
-    Y[(size_t)q * ys + yo + h * hd + lane + 32] = __float2half(a1 * inv);
-  }
 }
 
 // ------------------------- kernels: phase A (direct) -------------------------
@@ -1168,27 +1010,6 @@ static void autotune(Net& net, cudaStream_t st) {
 
 // ------------------------- CPU NMS -------------------------
 struct Det { float x1, y1, x2, y2, sc; int cls; };
-static float iou(const Det& a, const Det& b) {
-  float xx1 = std::max(a.x1, b.x1), yy1 = std::max(a.y1, b.y1);
-  float xx2 = std::min(a.x2, b.x2), yy2 = std::min(a.y2, b.y2);
-  float w = std::max(0.f, xx2 - xx1), h = std::max(0.f, yy2 - yy1);
-  float inter = w * h;
-  float ua = (a.x2 - a.x1) * (a.y2 - a.y1) + (b.x2 - b.x1) * (b.y2 - b.y1) - inter;
-  return ua > 0 ? inter / ua : 0;
-}
-static std::vector<Det> nms(std::vector<Det> v, float thr) {
-  std::sort(v.begin(), v.end(), [](const Det& a, const Det& b) { return a.sc > b.sc; });
-  std::vector<Det> keep;
-  std::vector<bool> dead(v.size(), false);
-  for (size_t i = 0; i < v.size(); i++) {
-    if (dead[i]) continue;
-    keep.push_back(v[i]);
-    for (size_t j = i + 1; j < v.size(); j++)
-      if (!dead[j] && v[j].cls == v[i].cls && iou(v[i], v[j]) > thr) dead[j] = true;
-  }
-  return keep;
-}
-
 // NMS ran on the GPU inside the graph; just fetch the compacted results.
 static std::vector<Det> fetchNMS(Net& net, cudaStream_t st) {
   // results were copied into pinned host memory inside the graph; stream is already synced
@@ -1253,8 +1074,6 @@ int main(int argc, char** argv) {
   CK(cudaMemcpy(ib.p, in.data(), in.size(), cudaMemcpyHostToDevice));
 
   cudaStream_t st; CK(cudaStreamCreate(&st));
-  CK(cudaFuncSetAttribute(k_attn_qk, cudaFuncAttributeMaxDynamicSharedMemorySize, 99 * 1024));
-  CK(cudaFuncSetAttribute(k_attn_av, cudaFuncAttributeMaxDynamicSharedMemorySize, 99 * 1024));
   if (mode != "dump" && !getenv("NOTUNE")) autotune(net, st);
 
   auto makeGraph = [&](cudaGraphExec_t& gexec) {
