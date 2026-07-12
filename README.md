@@ -87,6 +87,46 @@ env:
   NOFUSE=1   disable residual-add fusion (debugging)
 ```
 
+## Batch labeling at scale: the gRPC server
+
+The second way people use YOLO — mass labeling — gets its own binary. `yolo11serve` is a
+containerized gRPC server that GPU-decodes JPEGs (nvJPEG, parallel decoder pool), dynamic-batches
+requests, and runs the batched engine. Measured on the same RTX 3060 Ti, raw JPEG bytes in →
+boxes out over gRPC:
+
+```
+64 concurrent clients   1,123 img/s   p50  55 ms          (67,000+ labeled images/minute)
+128 concurrent clients  1,200 img/s   p50 100 ms
+8 concurrent clients      168 img/s   p99  51 ms  <- holds the 50 ms SLO exactly
+```
+
+**The scheduler** is deadline-aware dynamic batching: every request gets `deadline = arrival +
+target latency`. The batcher keeps admitting requests while the *oldest* one could still meet its
+deadline after a full max-batch run — computed from the engine's startup-calibrated per-batch-size
+latency model plus a decode-time EMA — and fires the moment waiting would risk the SLO or the
+batch fills. Throughput is maximized subject to the latency target; under light load it degrades
+gracefully to small, fast batches. Decode of batch *k+1* overlaps GPU execution of batch *k*
+(2-stage pipeline, ping-pong scratch buffers).
+
+```bash
+sudo apt install libgrpc++-dev protobuf-compiler-grpc libprotobuf-dev
+make serve && ./yolo11serve --dir build/yolo11n --max-batch 16 --target-ms 50
+# or containerized:
+docker build -t yolo11serve . && docker run --gpus all -p 50051:50051 -v $(pwd)/build:/app/build yolo11serve
+
+pip install grpcio grpcio-tools
+python3 client/label.py photos/*.jpg --out labels.jsonl -c 64   # mass labeling -> JSONL
+python3 client/label.py bus.jpg --bench 8000 -c 64              # throughput/latency benchmark
+```
+
+Batched engine (the foundation — `--batch N` on the CLI too):
+
+| | B=1 | B=4 | B=16 |
+|---|---|---|---|
+| yolo11n | 1,115 img/s | 1,823 img/s | **2,121 img/s** |
+
+That B=16 number is 2.3× what cuDNN reaches at its saturated batch-32 (927 img/s).
+
 ## Engineering notes — including the failures
 
 Everything was accepted or rejected on Nsight Compute / Systems measurements, and the rejects are documented so nobody walks the same dead ends:
