@@ -18,7 +18,7 @@ yolo11n, end-to-end (raw image in → boxes out)
 
 ultralytics predict   ██████████████████████████████████████  14.9 ms
 PyTorch fp16 (cuDNN)  ████████████████                         6.3 ms   (net only!)
-yolo11.cu             ███                                      1.21 ms  ← 12× end-to-end
+yolo11.cu             ███                                      1.13 ms  ← 13× end-to-end
 ```
 
 | | yolo11n | yolo11m |
@@ -26,7 +26,7 @@ yolo11.cu             ███                                      1.21 ms  �
 | ultralytics `predict` (full pipeline) | 14.9 ms | 11.3 ms |
 | PyTorch fp16 eager, **net only** (cuDNN) | 6.26 ms | 9.57 ms |
 | **yolo11.cu, net + decode + NMS** | **0.90 ms** · 1113 fps | **3.87 ms** · 258 fps |
-| **yolo11.cu, end-to-end** | **1.21 ms** · 828 fps | **4.07 ms** · 246 fps |
+| **yolo11.cu, end-to-end** | **1.13 ms** · 888 fps | **4.07 ms** · 246 fps |
 
 *End-to-end* means everything: H2D copy of the raw image, GPU letterboxing, the network, DFL decode, NMS — all captured in **one CUDA graph**, one launch per frame. The host's entire job is `cudaGraphLaunch` + one sync, then reading boxes out of pinned memory.
 
@@ -51,45 +51,47 @@ cls= 0 score=0.8336 box=(223.1, 405.6, 345.3, 859.8)    # person
 cls= 0 score=0.3989 box=(-0.1, 550.4, 66.2, 871.7)      # person
 
 $ ./yolo11cuda pipeline build/yolo11n
-end-to-end pipeline (H2D + preprocess + net + decode + NMS): 1.21 ms/frame (828 fps)
+end-to-end pipeline (H2D + preprocess + net + decode + NMS): 1.13 ms/frame (888 fps)
 ```
 
 Want a different scale? `make export MODEL=yolo11m && make test MODEL=yolo11m`. The exporter reads the graph out of the actual ultralytics model — channel widths, attention heads, block layouts — so n/s/m all work from the same code.
 
-## Why is it this fast?
+## Two ways to use it
 
-Because nothing is generic. Every kernel knows exactly what network it's running:
+YOLO deployments split into two very different shapes. This repo ships a dedicated path for each —
+and they are guarded against each other: every server/batching change is re-benchmarked at
+batch=1, and the single-frame numbers above are from *after* all of it landed.
 
-- **Implicit GEMM on tensor cores, written in raw PTX** — `mma.sync.m16n8k16` + `cp.async` multistage pipelines, XOR-swizzled shared memory, `ldmatrix`. The GEMM K axis is the flat `(ky, kx, ci)` index (*dense-K packing*): im2col coordinates advance incrementally, thin-channel layers waste zero lanes, and the hot loop contains **zero integer divisions**.
-- **The graph is fused flat.** BatchNorm is folded into weights at export. Every residual `ADD` in the network is absorbed into a conv epilogue (bias + SiLU + residual in registers). Every `split`/`concat` is zero-copy — convs write straight into slices of the concat buffers through strided views.
-- **Attention runs on the conv kernel.** C2PSA's Q·Kᵀ reads the K matrix *in place* from the qkv buffer by treating it as GEMM weights with a stride trick; P·V goes through the same kernel. 8× faster than a dedicated attention kernel we wrote first.
-- **The engine autotunes itself at startup** — for each conv it times 4-warp vs 8-warp tile variants (~tens of ms, once) and keeps the winner, so the dispatch adapts to your GPU instead of trusting a heuristic.
-- **Hybrid fp16-window accumulation** — Ampere runs fp32-accumulate HMMA at half rate, so the default accumulates in fp16 over a bounded K=64 window and flushes to fp32 registers: pure-fp16 speed, near-fp32 accuracy. `ACC16=1` / `ACC32=1` give you the pure modes.
-- **GPU-resident NMS** — bitonic sort sized to the live candidate count + greedy suppression, inside the graph. Nothing crosses PCIe except the final boxes (7 KB, into pinned memory, also inside the graph).
+### 1 · Ultra-low latency — embed the engine
 
-Every claim above is verifiable: `make test` re-derives references from PyTorch fp32 and checks **every single op's output** (109 ops for n, 141 for m), then checks final detections against ultralytics.
+For robotics, video pipelines, or anything that lives frame-to-frame: run batch=1 and embed the
+engine directly. The whole thing is one `.cu` file with a tiny C API (`engine/yolo11.h`) — no
+server, no IPC, no Python. Per frame the host does one CUDA-graph launch and one sync; boxes come
+back in pinned memory **1.13 ms** after the raw frame goes in.
 
-## CLI
+```c
+#include "engine/yolo11.h"
 
-```
-yolo11cuda <mode> [model-dir] [iters] [--image path]
+void* h = yolo_create("build/yolo11n", /*max_batch=*/1);   // load + autotune + build graph
 
-  detect     one inference, print detections (--image loads any jpg/png, boxes in original coords)
-  bench      net-only benchmark, stream launches vs CUDA graph
-  pipeline   end-to-end latency benchmark
-  profile    per-op timing breakdown
-  dump       write every op's output for test/compare.py
-
-env:
-  ACC16=1    pure fp16 mma accumulation   (fastest: n 0.94 / m 3.80 ms, ~2–3% max op error)
-  ACC32=1    pure fp32 mma accumulation   (most exact: n 0.98 / m 4.11 ms)
-  NOTUNE=1   skip the startup autotuner
-  NOFUSE=1   disable residual-add fusion (debugging)
+// per frame: dev_bgr = your BGR u8 HWC frame, already on the GPU
+yolo_preprocess(h, dev_bgr, height, width, /*slot=*/0);    // letterbox+normalize, async
+yolo_run(h, /*B=*/1);                                      // one graph launch + sync
+YoloDet dets[300];
+int n = yolo_get(h, /*slot=*/0, dets, 300);                // boxes in original image coords
 ```
 
-## Batch labeling at scale: the gRPC server
+```bash
+nvcc -O3 -arch=sm_86 -DYOLO11_LIB -c engine/engine.cu -o engine_lib.o   # link engine_lib.o + cudart
+```
 
-The second way people use YOLO — mass labeling — gets its own binary. `yolo11serve` is a
+Latency guardrails for this path: input already on-GPU skips the H2D+decode entirely (0.90 ms),
+`yolo_run_async`/`yolo_sync` let you overlap your own work, and `make bench` is the regression
+check — batch support added zero overhead at B=1 (verified: 0.90 ms before and after).
+
+### 2 · High throughput — the labeling server
+
+For dataset labeling and offline processing: `yolo11serve` is a
 containerized gRPC server that GPU-decodes JPEGs (nvJPEG, parallel decoder pool), dynamic-batches
 requests, and runs the batched engine. Measured on the same RTX 3060 Ti, raw JPEG bytes in →
 boxes out over gRPC:
@@ -126,6 +128,37 @@ Batched engine (the foundation — `--batch N` on the CLI too):
 | yolo11n | 1,115 img/s | 1,823 img/s | **2,121 img/s** |
 
 That B=16 number is 2.3× what cuDNN reaches at its saturated batch-32 (927 img/s).
+
+## Why is it this fast?
+
+Because nothing is generic. Every kernel knows exactly what network it's running:
+
+- **Implicit GEMM on tensor cores, written in raw PTX** — `mma.sync.m16n8k16` + `cp.async` multistage pipelines, XOR-swizzled shared memory, `ldmatrix`. The GEMM K axis is the flat `(ky, kx, ci)` index (*dense-K packing*): im2col coordinates advance incrementally, thin-channel layers waste zero lanes, and the hot loop contains **zero integer divisions**.
+- **The graph is fused flat.** BatchNorm is folded into weights at export. Every residual `ADD` in the network is absorbed into a conv epilogue (bias + SiLU + residual in registers). Every `split`/`concat` is zero-copy — convs write straight into slices of the concat buffers through strided views.
+- **Attention runs on the conv kernel.** C2PSA's Q·Kᵀ reads the K matrix *in place* from the qkv buffer by treating it as GEMM weights with a stride trick; P·V goes through the same kernel. 8× faster than a dedicated attention kernel we wrote first.
+- **The engine autotunes itself at startup** — for each conv it times 4-warp vs 8-warp tile variants (~tens of ms, once) and keeps the winner, so the dispatch adapts to your GPU instead of trusting a heuristic.
+- **Hybrid fp16-window accumulation** — Ampere runs fp32-accumulate HMMA at half rate, so the default accumulates in fp16 over a bounded K=64 window and flushes to fp32 registers: pure-fp16 speed, near-fp32 accuracy. `ACC16=1` / `ACC32=1` give you the pure modes.
+- **GPU-resident NMS** — bitonic sort sized to the live candidate count + greedy suppression, inside the graph. Nothing crosses PCIe except the final boxes (7 KB, into pinned memory, also inside the graph).
+
+Every claim above is verifiable: `make test` re-derives references from PyTorch fp32 and checks **every single op's output** (109 ops for n, 141 for m), then checks final detections against ultralytics.
+
+## CLI
+
+```
+yolo11cuda <mode> [model-dir] [iters] [--image path]
+
+  detect     one inference, print detections (--image loads any jpg/png, boxes in original coords)
+  bench      net-only benchmark, stream launches vs CUDA graph
+  pipeline   end-to-end latency benchmark
+  profile    per-op timing breakdown
+  dump       write every op's output for test/compare.py
+
+env:
+  ACC16=1    pure fp16 mma accumulation   (fastest: n 0.94 / m 3.80 ms, ~2–3% max op error)
+  ACC32=1    pure fp32 mma accumulation   (most exact: n 0.98 / m 4.11 ms)
+  NOTUNE=1   skip the startup autotuner
+  NOFUSE=1   disable residual-add fusion (debugging)
+```
 
 ## Engineering notes — including the failures
 
