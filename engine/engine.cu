@@ -35,6 +35,7 @@ struct Op {
 };
 
 struct Net {
+  int B = 1;                   // max batch size (buffers sized for this)
   std::vector<Buf> bufs;
   std::vector<Ten> tens;
   std::vector<Op> ops;
@@ -94,8 +95,8 @@ static void loadGraph(Net& net, const std::string& dir) {
   }
   fclose(f);
 
-  for (auto& b : net.bufs) CK(cudaMalloc(&b.p, (size_t)b.H * b.W * b.C * sizeof(__half)));
-  for (auto& b : net.bufs) CK(cudaMemset(b.p, 0, (size_t)b.H * b.W * b.C * sizeof(__half)));
+  for (auto& b : net.bufs) CK(cudaMalloc(&b.p, (size_t)net.B * b.H * b.W * b.C * sizeof(__half)));
+  for (auto& b : net.bufs) CK(cudaMemset(b.p, 0, (size_t)net.B * b.H * b.W * b.C * sizeof(__half)));
 
   auto wf = readFile(dir + "/weights.f16");
   auto bf = readFile(dir + "/bias.f32");
@@ -113,12 +114,12 @@ static void loadGraph(Net& net, const std::string& dir) {
   }
   CK(cudaMalloc(&net.weights, wf.size())); CK(cudaMemcpy(net.weights, wf.data(), wf.size(), cudaMemcpyHostToDevice));
   CK(cudaMalloc(&net.bias, bf.size()));    CK(cudaMemcpy(net.bias, bf.data(), bf.size(), cudaMemcpyHostToDevice));
-  CK(cudaMalloc(&net.dets, Net::MAXDET * 6 * sizeof(float)));
-  CK(cudaMalloc(&net.detcnt, sizeof(int)));
-  CK(cudaMalloc(&net.outdets, 300 * 6 * sizeof(float)));
-  CK(cudaMalloc(&net.outcnt, sizeof(int)));
-  CK(cudaMallocHost(&net.h_out, 300 * 6 * sizeof(float)));
-  CK(cudaMallocHost(&net.h_cnt, sizeof(int)));
+  CK(cudaMalloc(&net.dets, (size_t)net.B * Net::MAXDET * 6 * sizeof(float)));
+  CK(cudaMalloc(&net.detcnt, net.B * sizeof(int)));
+  CK(cudaMalloc(&net.outdets, (size_t)net.B * 300 * 6 * sizeof(float)));
+  CK(cudaMalloc(&net.outcnt, net.B * sizeof(int)));
+  CK(cudaMallocHost(&net.h_out, (size_t)net.B * 300 * 6 * sizeof(float)));
+  CK(cudaMallocHost(&net.h_cnt, net.B * sizeof(int)));
   // attention scratch sized from the graph (heads varies by model scale)
   int maxheads = 0, maxN = 0, maxhd = 64;
   for (const Op& op : net.ops)
@@ -167,7 +168,7 @@ __global__ void __launch_bounds__(WARPS_M * WARPS_N * 32, 2) k_conv_mma(
     __half* __restrict__ Y, int Ho, int Wo, int ys, int yo,
     const __half* __restrict__ Wt, long wstride, const float* __restrict__ Bias,
     const __half* __restrict__ Res, int rs, int ro,
-    int Cin, int Cout, int K, int S, int P, int act) {
+    int Cin, int Cout, int K, int S, int P, int act, int Bn) {
   constexpr int BK = 32;
   constexpr int THREADS = WARPS_M * WARPS_N * 32;
   constexpr int WM = BM / WARPS_M, WN = BN / WARPS_N;
@@ -175,7 +176,7 @@ __global__ void __launch_bounds__(WARPS_M * WARPS_N * 32, 2) k_conv_mma(
   __shared__ __half As[STAGES][BM * BK];
   __shared__ __half Bs[STAGES][BN * BK];
 
-  const int M = Ho * Wo;
+  const int M = Bn * Ho * Wo;
   const int bm = blockIdx.x * BM, bn = blockIdx.y * BN;
   const int tid = threadIdx.x;
   const int warp = tid >> 5, lane = tid & 31;
@@ -202,14 +203,16 @@ __global__ void __launch_bounds__(WARPS_M * WARPS_N * 32, 2) k_conv_mma(
   int a_ky = a_r / K, a_kx = a_r % K;
   int a_kg = asegbase * 8;                  // this seg's flat k index
   constexpr int ASLOTS = (BM * 4 + THREADS - 1) / THREADS;
-  int ybase[ASLOTS], xbase[ASLOTS];
+  int ybase[ASLOTS], xbase[ASLOTS], brow[ASLOTS];
   bool mok[ASLOTS];
 #pragma unroll
   for (int i = 0; i < ASLOTS; i++) {
     int m = bm + ((tid + i * THREADS) >> 2);
     mok[i] = (m < M) && (tid + i * THREADS < BM * 4);
-    int oy = m / Wo, ox = m % Wo;
+    int img = m / (Ho * Wo), rem = m % (Ho * Wo);
+    int oy = rem / Wo, ox = rem % Wo;
     ybase[i] = oy * S - P; xbase[i] = ox * S - P;
+    brow[i] = img * H;                   // batched row base of this slot's image
   }
 
   auto loadA = [&](int stage, int ks) {
@@ -228,7 +231,7 @@ __global__ void __launch_bounds__(WARPS_M * WARPS_N * 32, 2) k_conv_mma(
         int iy = ybase[i] + a_ky, ix = xbase[i] + a_kx;
         bool ok = mok[i] && (iy >= 0) && (iy < H) && (ix >= 0) && (ix < W) && (a_kg < Ktot);
         if (ok) {
-          CP_ASYNC16(dst, X + ((size_t)iy * W + ix) * xs + xo + a_ci);
+          CP_ASYNC16(dst, X + ((size_t)(brow[i] + iy) * W + ix) * xs + xo + a_ci);
         } else {
           *(uint4*)&As[stage][swz(row, asegbase)] = make_uint4(0, 0, 0, 0);
         }
@@ -373,7 +376,7 @@ __global__ void __launch_bounds__(WARPS_M * WARPS_N * 32, 2) k_conv_mma(
 // blockIdx.y selects the chunk (keeps register pressure flat for wide first convs).
 __global__ void k_conv0(const __half* __restrict__ X, int H, int W,
                         __half* __restrict__ Y, int Ho, int Wo, int Cout,
-                        const __half* __restrict__ Wt, const float* __restrict__ B, int act) {
+                        const __half* __restrict__ Wt, const float* __restrict__ B, int act, int Bn) {
   const int CHUNK = 16, CIN = 3, K = 3, S = 2, P = 1;
   const int co0 = blockIdx.y * CHUNK;
   __shared__ __half ws[CHUNK * K * K * CIN];   // 432
@@ -382,8 +385,10 @@ __global__ void k_conv0(const __half* __restrict__ X, int H, int W,
   for (int i = threadIdx.x; i < CHUNK; i += blockDim.x) bs[i] = B[co0 + i];
   __syncthreads();
   int pix = blockIdx.x * blockDim.x + threadIdx.x;
-  if (pix >= Ho * Wo) return;
-  int ox = pix % Wo, oy = pix / Wo;
+  if (pix >= Bn * Ho * Wo) return;
+  int rem = pix % (Ho * Wo);
+  int ox = rem % Wo, oy = rem / Wo;
+  const __half* Xb = X + (size_t)(pix / (Ho * Wo)) * H * W * CIN;
   float acc[CHUNK];
 #pragma unroll
   for (int c = 0; c < CHUNK; c++) acc[c] = bs[c];
@@ -396,7 +401,7 @@ __global__ void k_conv0(const __half* __restrict__ X, int H, int W,
       int ix = ox * S - P + kx;
       if (ix < 0 || ix >= W) continue;
       float in[CIN];
-      const __half* xp = X + ((size_t)iy * W + ix) * CIN;
+      const __half* xp = Xb + ((size_t)iy * W + ix) * CIN;
 #pragma unroll
       for (int i = 0; i < CIN; i++) in[i] = __half2float(xp[i]);
 #pragma unroll
@@ -419,13 +424,14 @@ __global__ void k_dwconv8(const __half* __restrict__ X, int H, int W, int xs, in
                           __half* __restrict__ Y, int Ho, int Wo, int ys, int yo,
                           const __half* __restrict__ Wt, const float* __restrict__ B,
                           const __half* __restrict__ Res, int rs, int ro,
-                          int C, int K, int S, int P, int act) {
+                          int C, int K, int S, int P, int act, int Bn) {
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
   int cg = C >> 3;
-  if (idx >= Ho * Wo * cg) return;
+  if (idx >= Bn * Ho * Wo * cg) return;
   int g = idx % cg, pix = idx / cg;
   int c = g << 3;
-  int ox = pix % Wo, oy = pix / Wo;
+  int rem = pix % (Ho * Wo), brow = (pix / (Ho * Wo)) * H;
+  int ox = rem % Wo, oy = rem / Wo;
   float acc[8];
   {
     const float4 b0 = *(const float4*)(B + c), b1 = *(const float4*)(B + c + 4);
@@ -440,7 +446,7 @@ __global__ void k_dwconv8(const __half* __restrict__ X, int H, int W, int xs, in
     for (int kx = 0; kx < 3; kx++) {
       int ix = ox * S - P + kx;
       if (ix < 0 || ix >= W) continue;
-      const __half* xp = X + ((size_t)iy * W + ix) * xs + xo + c;
+      const __half* xp = X + ((size_t)(brow + iy) * W + ix) * xs + xo + c;
       const __half* wq = Wt + (ky * 3 + kx) * C + c;
       uint4 xv = *(const uint4*)xp, wv = *(const uint4*)wq;
       const __half *xh = (const __half*)&xv, *wh = (const __half*)&wv;
@@ -552,13 +558,14 @@ __global__ void k_add(const __half* A, int as, int ao, const __half* Bp, int bs,
 }
 
 __global__ void k_maxpool5(const __half* X, int xs, int xo, __half* Y, int ys, int yo,
-                           int H, int W, int C) {  // C % 8 == 0, vec8 channels
+                           int H, int W, int C, int Bn) {  // C % 8 == 0, vec8 channels
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
   int cg = C >> 3;
-  if (idx >= H * W * cg) return;
+  if (idx >= Bn * H * W * cg) return;
   int g = idx % cg, pix = idx / cg;
   int c = g << 3;
-  int x0 = pix % W, y0 = pix / W;
+  int rem = pix % (H * W), brow = (pix / (H * W)) * H;
+  int x0 = rem % W, y0 = rem / W;
   __half2 m[4];
 #pragma unroll
   for (int i = 0; i < 4; i++) m[i] = __floats2half2_rn(-6e4f, -6e4f);
@@ -566,25 +573,26 @@ __global__ void k_maxpool5(const __half* X, int xs, int xo, __half* Y, int ys, i
     int iy = y0 + dy; if (iy < 0 || iy >= H) continue;
     for (int dx = -2; dx <= 2; dx++) {
       int ix = x0 + dx; if (ix < 0 || ix >= W) continue;
-      uint4 v = *(const uint4*)(X + ((size_t)iy * W + ix) * xs + xo + c);
+      uint4 v = *(const uint4*)(X + ((size_t)(brow + iy) * W + ix) * xs + xo + c);
       const __half2* h2 = (const __half2*)&v;
 #pragma unroll
       for (int i = 0; i < 4; i++) m[i] = __hmax2(m[i], h2[i]);
     }
   }
-  *(uint4*)(Y + ((size_t)y0 * W + x0) * ys + yo + c) = *(uint4*)m;
+  *(uint4*)(Y + (size_t)pix * ys + yo + c) = *(uint4*)m;
 }
 
 __global__ void k_upsample2(const __half* X, int xs, int xo, __half* Y, int ys, int yo,
-                            int H, int W, int C) {  // out is 2H x 2W, C % 8 == 0
+                            int H, int W, int C, int Bn) {  // out is 2H x 2W, C % 8 == 0
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
   int Wo = W * 2, Ho = H * 2, cg = C >> 3;
-  if (idx >= Ho * Wo * cg) return;
+  if (idx >= Bn * Ho * Wo * cg) return;
   int g = idx % cg, pix = idx / cg;
   int c = g << 3;
-  int ox = pix % Wo, oy = pix / Wo;
-  *(uint4*)(Y + ((size_t)oy * Wo + ox) * ys + yo + c) =
-      *(const uint4*)(X + ((size_t)(oy >> 1) * W + (ox >> 1)) * xs + xo + c);
+  int rem = pix % (Ho * Wo), brow = (pix / (Ho * Wo)) * H;
+  int ox = rem % Wo, oy = rem / Wo;
+  *(uint4*)(Y + (size_t)pix * ys + yo + c) =
+      *(const uint4*)(X + ((size_t)(brow + (oy >> 1)) * W + (ox >> 1)) * xs + xo + c);
 }
 
 __global__ void k_copyc(const __half* X, int xs, int xo, __half* Y, int ys, int yo, int HW, int C) {
@@ -657,10 +665,11 @@ __global__ void k_attn(const __half* __restrict__ QKV, int qs, int qo,
 __global__ void k_decode(const __half* __restrict__ BOX, int bs, int bo,
                          const __half* __restrict__ CLS, int cs, int co,
                          int H, int W, int stride, float conf,
-                         float* __restrict__ out, int* __restrict__ cnt, int maxdet, int nc) {
+                         float* __restrict__ out, int* __restrict__ cnt, int maxdet, int nc, int Bn) {
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  if (idx >= H * W) return;
-  int x = idx % W, y = idx / W;
+  if (idx >= Bn * H * W) return;
+  int img = idx / (H * W), rem = idx % (H * W);
+  int x = rem % W, y = rem / W;
   const __half* cp = CLS + (size_t)idx * cs + co;
   float best = -1e30f; int bcls = 0;
   for (int c0 = 0; c0 < nc; c0 += 8) {         // nc % 8 == 0 (80)
@@ -692,9 +701,9 @@ __global__ void k_decode(const __half* __restrict__ BOX, int bs, int bo,
     d[side] = e / sum;
   }
   float cx = x + 0.5f, cy = y + 0.5f;
-  int slot = atomicAdd(cnt, 1);
+  int slot = atomicAdd(cnt + img, 1);
   if (slot >= maxdet) return;
-  float* o = out + slot * 6;
+  float* o = out + ((size_t)img * maxdet + slot) * 6;
   o[0] = (cx - d[0]) * stride; o[1] = (cy - d[1]) * stride;
   o[2] = (cx + d[2]) * stride; o[3] = (cy + d[3]) * stride;
   o[4] = score; o[5] = (float)bcls;
@@ -737,8 +746,12 @@ __global__ void k_preprocess(const uint8_t* __restrict__ src, int sh, int sw,
 // single-block GPU NMS: bitonic sort by score, greedy suppression, compacted output.
 #define NMS_CAP 1024
 #define MAX_OUT 300
-__global__ void k_nms(const float* __restrict__ cand, const int* __restrict__ cnt,
-                      float* __restrict__ out, int* __restrict__ outcnt, float thr) {
+__global__ void k_nms(const float* __restrict__ cand0, const int* __restrict__ cnt0,
+                      float* __restrict__ out0, int* __restrict__ outcnt0, float thr, int maxdet) {
+  const float* cand = cand0 + (size_t)blockIdx.x * maxdet * 6;
+  float* out = out0 + (size_t)blockIdx.x * MAX_OUT * 6;
+  const int* cnt = cnt0 + blockIdx.x;
+  int* outcnt = outcnt0 + blockIdx.x;
   __shared__ float bx1[NMS_CAP], by1[NMS_CAP], bx2[NMS_CAP], by2[NMS_CAP], bsc[NMS_CAP];
   __shared__ short bcl[NMS_CAP];
   __shared__ unsigned char dead[NMS_CAP];
@@ -811,21 +824,21 @@ static View view(const Net& n, int tid) {
   return { b.p, b.C, t.coff, b.H, b.W, t.C };
 }
 
-static void runOp(Net& net, const Op& op, cudaStream_t st) {
+static void runOp(Net& net, const Op& op, cudaStream_t st, int Bn) {
   const int TB = 256;
   switch (op.kind) {
     case CONV: {
       View x = view(net, op.a), y = view(net, op.out);
       int total = y.H * y.W * op.Cout;
       if (op.g == 1 && op.Cin == 3) {   // first conv
-        dim3 g0((y.H * y.W + 255) / 256, op.Cout / 16);
+        dim3 g0((Bn * y.H * y.W + 255) / 256, op.Cout / 16);
         k_conv0<<<g0, 256, 0, st>>>(x.p, x.H, x.W, (__half*)y.p, y.H, y.W, op.Cout,
-                                    net.weights + op.woff, net.bias + op.boff, op.act);
+                                    net.weights + op.woff, net.bias + op.boff, op.act, Bn);
       } else if (op.g == 1 && op.Cin >= 8) {
         View r{};
         bool hasRes = op.b >= 0;
         if (hasRes) r = view(net, op.b);
-        int M = y.H * y.W;
+        int M = Bn * y.H * y.W;
         int b64 = ((M + 63) / 64) * ((op.Cout + 63) / 64);
         bool kone = (op.k == 1 && op.s == 1 && op.p == 0);
         long Ktot = (long)op.k * op.k * op.Cin;
@@ -835,7 +848,7 @@ static void runOp(Net& net, const Op& op, cudaStream_t st) {
               x.p, x.H, x.W, x.s, x.o, (__half*)y.p, y.H, y.W, y.s, y.o,
               net.weights + op.woff, Ktot, net.bias + op.boff,
               hasRes ? r.p : nullptr, hasRes ? r.s : 0, hasRes ? r.o : 0,
-              op.Cin, op.Cout, op.k, op.s, op.p, op.act);
+              op.Cin, op.Cout, op.k, op.s, op.p, op.act, Bn);
         };
         static const int amode = getenv("ACC16") ? 1 : (getenv("ACC32") ? 0 : 2);
 #define LAUNCH_TILE(BM_, BN_, ST_, WM_, WN_)                                                     \
@@ -872,38 +885,38 @@ static void runOp(Net& net, const Op& op, cudaStream_t st) {
         View r{};
         bool hasRes = op.b >= 0;
         if (hasRes) r = view(net, op.b);
-        int nthr = y.H * y.W * (op.Cin / 8);
+        int nthr = Bn * y.H * y.W * (op.Cin / 8);
         k_dwconv8<<<(nthr + TB - 1) / TB, TB, 0, st>>>(
             x.p, x.H, x.W, x.s, x.o, (__half*)y.p, y.H, y.W, y.s, y.o,
             net.weights + op.woff, net.bias + op.boff,
             hasRes ? r.p : nullptr, hasRes ? r.s : 0, hasRes ? r.o : 0,
-            op.Cin, op.k, op.s, op.p, op.act);
+            op.Cin, op.k, op.s, op.p, op.act, Bn);
       }
       break;
     }
     case ADD: {
       View a = view(net, op.a), b = view(net, op.b), y = view(net, op.out);
-      int total = a.H * a.W * a.C;
+      int total = Bn * a.H * a.W * a.C;
       k_add<<<(total + TB - 1) / TB, TB, 0, st>>>(a.p, a.s, a.o, b.p, b.s, b.o,
-                                                 (__half*)y.p, y.s, y.o, a.H * a.W, a.C);
+                                                 (__half*)y.p, y.s, y.o, Bn * a.H * a.W, a.C);
       break;
     }
     case MAXPOOL5: {
       View x = view(net, op.a), y = view(net, op.out);
-      int total = x.H * x.W * (x.C / 8);
-      k_maxpool5<<<(total + TB - 1) / TB, TB, 0, st>>>(x.p, x.s, x.o, (__half*)y.p, y.s, y.o, x.H, x.W, x.C);
+      int total = Bn * x.H * x.W * (x.C / 8);
+      k_maxpool5<<<(total + TB - 1) / TB, TB, 0, st>>>(x.p, x.s, x.o, (__half*)y.p, y.s, y.o, x.H, x.W, x.C, Bn);
       break;
     }
     case UPSAMPLE2: {
       View x = view(net, op.a), y = view(net, op.out);
-      int total = y.H * y.W * 4 * (x.C / 8);
-      k_upsample2<<<(total + TB - 1) / TB, TB, 0, st>>>(x.p, x.s, x.o, (__half*)y.p, y.s, y.o, x.H, x.W, x.C);
+      int total = Bn * y.H * y.W * 4 * (x.C / 8);
+      k_upsample2<<<(total + TB - 1) / TB, TB, 0, st>>>(x.p, x.s, x.o, (__half*)y.p, y.s, y.o, x.H, x.W, x.C, Bn);
       break;
     }
     case COPYC: {
       View x = view(net, op.a), y = view(net, op.out);
-      int total = x.H * x.W * x.C;
-      k_copyc<<<(total + TB - 1) / TB, TB, 0, st>>>(x.p, x.s, x.o, (__half*)y.p, y.s, y.o, x.H * x.W, x.C);
+      int total = Bn * x.H * x.W * x.C;
+      k_copyc<<<(total + TB - 1) / TB, TB, 0, st>>>(x.p, x.s, x.o, (__half*)y.p, y.s, y.o, Bn * x.H * x.W, x.C);
       break;
     }
     case ATTN: {
@@ -914,27 +927,32 @@ static void runOp(Net& net, const Op& op, cudaStream_t st) {
         //   scores[h] = Q[400x32] @ K^T   (K rows read in place from the qkv buffer)
         //   P = softmax(scores * 1/sqrt(kd));  out[h] = P[400x400] @ V[400x64] via V^T
         const int per = 2 * op.kd + op.hd;
-        for (int h = 0; h < op.heads; h++) {
-          dim3 g1((N + 63) / 64, (N + 63) / 64);
-          k_conv_mma<64, 64, 3, true><<<g1, 128, 0, st>>>(
-              q.p, N, 1, q.s, q.o + h * per,
-              net.attnP + (size_t)h * N * N, N, 1, N, 0,
-              q.p + q.o + h * per + op.kd, q.s, net.zerobias,
-              nullptr, 0, 0, op.kd, N, 1, 1, 0, 0);
-        }
-        k_softmax_rows<<<(op.heads * N + 7) / 8, 256, 0, st>>>(
-            net.attnP, op.heads * N, N, rsqrtf((float)op.kd));
-        k_vtrans<<<(op.heads * op.hd * N + 255) / 256, 256, 0, st>>>(
-            q.p, q.s, q.o, net.vt, N, op.kd, op.hd, op.heads);
-        for (int h = 0; h < op.heads; h++) {
-          dim3 g2((N + 31) / 32, (op.hd + 31) / 32);
-          k_conv_mma<32, 32, 3, true><<<g2, 128, 0, st>>>(
-              net.attnP + (size_t)h * N * N, N, 1, N, 0,
-              (__half*)y.p, N, 1, y.s, y.o + h * op.hd,
-              net.vt + (size_t)h * op.hd * N, N, net.zerobias,
-              nullptr, 0, 0, N, op.hd, 1, 1, 0, 0);
+        for (int img = 0; img < Bn; img++) {   // per-image attention (tokens must not mix)
+          const __half* qb = q.p + (size_t)img * N * q.s;
+          __half* yb = (__half*)y.p + (size_t)img * N * y.s;
+          for (int h = 0; h < op.heads; h++) {
+            dim3 g1((N + 63) / 64, (N + 63) / 64);
+            k_conv_mma<64, 64, 3, true><<<g1, 128, 0, st>>>(
+                qb, N, 1, q.s, q.o + h * per,
+                net.attnP + (size_t)h * N * N, N, 1, N, 0,
+                qb + q.o + h * per + op.kd, q.s, net.zerobias,
+                nullptr, 0, 0, op.kd, N, 1, 1, 0, 0, 1);
+          }
+          k_softmax_rows<<<(op.heads * N + 7) / 8, 256, 0, st>>>(
+              net.attnP, op.heads * N, N, rsqrtf((float)op.kd));
+          k_vtrans<<<(op.heads * op.hd * N + 255) / 256, 256, 0, st>>>(
+              qb, q.s, q.o, net.vt, N, op.kd, op.hd, op.heads);
+          for (int h = 0; h < op.heads; h++) {
+            dim3 g2((N + 31) / 32, (op.hd + 31) / 32);
+            k_conv_mma<32, 32, 3, true><<<g2, 128, 0, st>>>(
+                net.attnP + (size_t)h * N * N, N, 1, N, 0,
+                yb, N, 1, y.s, y.o + h * op.hd,
+                net.vt + (size_t)h * op.hd * N, N, net.zerobias,
+                nullptr, 0, 0, N, op.hd, 1, 1, 0, 0, 1);
+          }
         }
       } else {
+        if (Bn != 1) { fprintf(stderr, "fallback attention supports batch=1 only\n"); exit(1); }
         dim3 grid(N, op.heads);
         size_t smem = N * sizeof(float);
         k_attn<<<grid, 128, smem, st>>>(q.p, q.s, q.o, (__half*)y.p, y.s, y.o, N, op.heads, op.kd, op.hd);
@@ -943,20 +961,20 @@ static void runOp(Net& net, const Op& op, cudaStream_t st) {
     }
     case DECODE: {
       View b = view(net, op.a), c = view(net, op.b);
-      int total = b.H * b.W;
+      int total = Bn * b.H * b.W;
       k_decode<<<(total + TB - 1) / TB, TB, 0, st>>>(b.p, b.s, b.o, c.p, c.s, c.o,
-          b.H, b.W, op.stride, 0.25f, net.dets, net.detcnt, Net::MAXDET, 80);
+          b.H, b.W, op.stride, 0.25f, net.dets, net.detcnt, Net::MAXDET, 80, Bn);
       break;
     }
   }
 }
 
-static void forward(Net& net, cudaStream_t st) {
-  CK(cudaMemsetAsync(net.detcnt, 0, sizeof(int), st));
-  for (auto& op : net.ops) runOp(net, op, st);
-  k_nms<<<1, 256, 0, st>>>(net.dets, net.detcnt, net.outdets, net.outcnt, 0.45f);
-  CK(cudaMemcpyAsync(net.h_cnt, net.outcnt, sizeof(int), cudaMemcpyDeviceToHost, st));
-  CK(cudaMemcpyAsync(net.h_out, net.outdets, 300 * 6 * sizeof(float), cudaMemcpyDeviceToHost, st));
+static void forward(Net& net, cudaStream_t st, int Bn) {
+  CK(cudaMemsetAsync(net.detcnt, 0, Bn * sizeof(int), st));
+  for (auto& op : net.ops) runOp(net, op, st, Bn);
+  k_nms<<<Bn, 256, 0, st>>>(net.dets, net.detcnt, net.outdets, net.outcnt, 0.45f, Net::MAXDET);
+  CK(cudaMemcpyAsync(net.h_cnt, net.outcnt, Bn * sizeof(int), cudaMemcpyDeviceToHost, st));
+  CK(cudaMemcpyAsync(net.h_out, net.outdets, (size_t)Bn * 300 * 6 * sizeof(float), cudaMemcpyDeviceToHost, st));
 }
 
 // fuse CONV + following ADD (residual) into the conv epilogue
@@ -994,9 +1012,9 @@ static void autotune(Net& net, cudaStream_t st) {
     float t[2];
     for (int v = 1; v <= 2; v++) {
       op.variant = v;
-      runOp(net, op, st);                       // warm
+      runOp(net, op, st, net.B);                // warm
       cudaEventRecord(e0, st);
-      for (int r = 0; r < 8; r++) runOp(net, op, st);
+      for (int r = 0; r < 8; r++) runOp(net, op, st, net.B);
       cudaEventRecord(e1, st);
       CK(cudaStreamSynchronize(st));
       cudaEventElapsedTime(&t[v - 1], e0, e1);
@@ -1011,13 +1029,12 @@ static void autotune(Net& net, cudaStream_t st) {
 // ------------------------- CPU NMS -------------------------
 struct Det { float x1, y1, x2, y2, sc; int cls; };
 // NMS ran on the GPU inside the graph; just fetch the compacted results.
-static std::vector<Det> fetchNMS(Net& net, cudaStream_t st) {
+static std::vector<Det> fetchNMS(Net& net, int img = 0) {
   // results were copied into pinned host memory inside the graph; stream is already synced
-  (void)st;
-  int cnt = *net.h_cnt;
+  int cnt = net.h_cnt[img];
   std::vector<Det> v;
   for (int i = 0; i < cnt; i++) {
-    const float* d = net.h_out + i * 6;
+    const float* d = net.h_out + ((size_t)img * 300 + i) * 6;
     v.push_back({d[0], d[1], d[2], d[3], d[4], (int)d[5]});
   }
   return v;
@@ -1034,7 +1051,7 @@ static uint8_t* loadImageBGR(const std::string& path, int& sh, int& sw) {
 
 static void usage() {
   printf("yolo11cuda — hand-written CUDA inference engine for YOLO11\n\n"
-         "usage: yolo11cuda <mode> [model-dir] [iters] [--image path]\n\n"
+         "usage: yolo11cuda <mode> [model-dir] [iters] [--image path] [--batch N]\n\n"
          "modes:\n"
          "  detect    run one inference, print detections (--image for any jpg/png)\n"
          "  bench     net-only benchmark (stream vs CUDA graph)\n"
@@ -1052,9 +1069,11 @@ int main(int argc, char** argv) {
   std::string dir = "build/yolo11n";
   int iterArg = -1;
   std::string image;
+  int batch = 1;
   for (int i = 2; i < argc; i++) {
     std::string a = argv[i];
     if (a == "--image" && i + 1 < argc) image = argv[++i];
+    else if (a == "--batch" && i + 1 < argc) batch = atoi(argv[++i]);
     else if (a == "-h" || a == "--help") { usage(); return 0; }
     else if (a[0] >= '0' && a[0] <= '9') iterArg = atoi(a.c_str());
     else dir = a;
@@ -1065,13 +1084,16 @@ int main(int argc, char** argv) {
     return mode == "-h" || mode == "--help" || mode == "help" ? 0 : 1;
   }
   Net net;
+  net.B = batch;
   loadGraph(net, dir);
   if (mode != "dump" && !getenv("NOFUSE")) fuseAdds(net);
 
   // default input: the exporter's pre-letterboxed reference image
   auto in = readFile(dir + "/input.f16");
   Buf& ib = net.bufs[net.tens[0].buf];
-  CK(cudaMemcpy(ib.p, in.data(), in.size(), cudaMemcpyHostToDevice));
+  for (int b = 0; b < net.B; b++)   // replicate reference input across the batch
+    CK(cudaMemcpy(ib.p + (size_t)b * (in.size() / sizeof(__half)), in.data(), in.size(),
+                  cudaMemcpyHostToDevice));
 
   cudaStream_t st; CK(cudaStreamCreate(&st));
   if (mode != "dump" && !getenv("NOTUNE")) autotune(net, st);
@@ -1079,7 +1101,7 @@ int main(int argc, char** argv) {
   auto makeGraph = [&](cudaGraphExec_t& gexec) {
     cudaGraph_t graph;
     CK(cudaStreamBeginCapture(st, cudaStreamCaptureModeGlobal));
-    forward(net, st);
+    forward(net, st, net.B);
     CK(cudaStreamEndCapture(st, &graph));
     CK(cudaGraphInstantiate(&gexec, graph, 0));
     CK(cudaGraphDestroy(graph));
@@ -1089,7 +1111,7 @@ int main(int argc, char** argv) {
     CK(cudaMemsetAsync(net.detcnt, 0, sizeof(int), st));
     system(("mkdir -p " + dir + "/gpu").c_str());
     for (size_t k = 0; k < net.ops.size(); k++) {
-      runOp(net, net.ops[k], st);
+      runOp(net, net.ops[k], st, net.B);
       CK(cudaStreamSynchronize(st));
       CK(cudaGetLastError());
       const Op& op = net.ops[k];
@@ -1119,10 +1141,16 @@ int main(int argc, char** argv) {
       k_preprocess<<<(640 * 640 + 255) / 256, 256, 0, st>>>(
           dimg, sh, sw, ib.p, 640, 640, scale, top, left, nh, nw);
     }
-    forward(net, st);
+    forward(net, st, net.B);
     CK(cudaStreamSynchronize(st));
     CK(cudaGetLastError());
-    auto keep = fetchNMS(net, st);
+    auto keep = fetchNMS(net);
+    if (net.B > 1) {   // batched self-consistency: every image got identical input
+      printf("batch=%d per-image kept:", net.B);
+      bool same = true;
+      for (int b = 0; b < net.B; b++) { printf(" %d", net.h_cnt[b]); same &= net.h_cnt[b] == net.h_cnt[0]; }
+      printf("  %s\n", same ? "(consistent)" : "(MISMATCH!)");
+    }
     printf("kept=%zu%s\n", keep.size(), image.empty() ? "" : "  (boxes in original image coords)");
     for (auto& d : keep)   // map back to original image coordinates when letterboxed
       printf("cls=%2d score=%.4f box=(%.1f, %.1f, %.1f, %.1f)\n", d.cls, d.sc,
@@ -1149,7 +1177,7 @@ int main(int argc, char** argv) {
     CK(cudaMemcpyAsync(dimg, himg, raw.size(), cudaMemcpyHostToDevice, st));
     k_preprocess<<<(640 * 640 + 255) / 256, 256, 0, st>>>(
         dimg, sh, sw, inb.p, 640, 640, scale, top, left, nh, nw);
-    forward(net, st);
+    forward(net, st, net.B);
     CK(cudaStreamEndCapture(st, &graph));
     CK(cudaGraphInstantiate(&gexec, graph, 0));
     CK(cudaGraphDestroy(graph));
@@ -1157,18 +1185,18 @@ int main(int argc, char** argv) {
     CK(cudaGraphLaunch(gexec, st));
     CK(cudaStreamSynchronize(st));
     CK(cudaGetLastError());
-    auto keep = fetchNMS(net, st);
+    auto keep = fetchNMS(net);
     printf("kept=%zu\n", keep.size());
     for (auto& d : keep)
       printf("cls=%2d score=%.4f box=(%.1f, %.1f, %.1f, %.1f)\n", d.cls, d.sc, d.x1, d.y1, d.x2, d.y2);
 
     int iters = iterArg > 0 ? iterArg : 300;
-    for (int i = 0; i < 20; i++) { CK(cudaGraphLaunch(gexec, st)); CK(cudaStreamSynchronize(st)); fetchNMS(net, st); }
+    for (int i = 0; i < 20; i++) { CK(cudaGraphLaunch(gexec, st)); CK(cudaStreamSynchronize(st)); fetchNMS(net); }
     auto t0 = std::chrono::steady_clock::now();
     for (int i = 0; i < iters; i++) {
       CK(cudaGraphLaunch(gexec, st));
       CK(cudaStreamSynchronize(st));
-      fetchNMS(net, st);
+      fetchNMS(net);
     }
     auto t1 = std::chrono::steady_clock::now();
     double ms = std::chrono::duration<double, std::milli>(t1 - t0).count() / iters;
@@ -1179,13 +1207,13 @@ int main(int argc, char** argv) {
     std::vector<float> acc(net.ops.size(), 0.f);
     std::vector<cudaEvent_t> ev(net.ops.size() + 1);
     for (auto& e : ev) cudaEventCreate(&e);
-    for (int i = 0; i < 10; i++) forward(net, st);
+    for (int i = 0; i < 10; i++) forward(net, st, net.B);
     CK(cudaStreamSynchronize(st));
     for (int it = 0; it < iters; it++) {
       CK(cudaMemsetAsync(net.detcnt, 0, sizeof(int), st));
       cudaEventRecord(ev[0], st);
       for (size_t k = 0; k < net.ops.size(); k++) {
-        runOp(net, net.ops[k], st);
+        runOp(net, net.ops[k], st, net.B);
         cudaEventRecord(ev[k + 1], st);
       }
       CK(cudaStreamSynchronize(st));
@@ -1211,10 +1239,10 @@ int main(int argc, char** argv) {
   } else if (mode == "bench") {
     int iters = iterArg > 0 ? iterArg : 200;
     cudaEvent_t e0, e1; cudaEventCreate(&e0); cudaEventCreate(&e1);
-    for (int i = 0; i < 20; i++) forward(net, st);
+    for (int i = 0; i < 20; i++) forward(net, st, net.B);
     CK(cudaStreamSynchronize(st));
     cudaEventRecord(e0, st);
-    for (int i = 0; i < iters; i++) forward(net, st);
+    for (int i = 0; i < iters; i++) forward(net, st, net.B);
     cudaEventRecord(e1, st);
     CK(cudaStreamSynchronize(st));
     float ms; cudaEventElapsedTime(&ms, e0, e1);
