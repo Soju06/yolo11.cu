@@ -30,6 +30,7 @@ struct Op {
   int k = 0, s = 0, p = 0, g = 0, act = 0, Cin = 0, Cout = 0;
   long woff = 0, boff = 0;
   int heads = 0, kd = 0, hd = 0;       // ATTN
+  int variant = 0;                      // autotuned warp grid (0=heuristic, 1=2x2, 2=2x4)
   int stride = 0;                       // DECODE
 };
 
@@ -43,6 +44,8 @@ struct Net {
   int*    detcnt = nullptr;    // device counter
   float*  outdets = nullptr;   // device NMS output [MAX_OUT*6]
   int*    outcnt = nullptr;
+  float*  h_out = nullptr;     // pinned host mirrors (copied inside the graph)
+  int*    h_cnt = nullptr;
   __half* attnP = nullptr;     // attention probs [heads][N][N]
   __half* vt = nullptr;        // V transposed [heads][hd][N]
   float*  zerobias = nullptr;  // zero bias for GEMM-as-conv calls
@@ -114,6 +117,8 @@ static void loadGraph(Net& net, const std::string& dir) {
   CK(cudaMalloc(&net.detcnt, sizeof(int)));
   CK(cudaMalloc(&net.outdets, 300 * 6 * sizeof(float)));
   CK(cudaMalloc(&net.outcnt, sizeof(int)));
+  CK(cudaMallocHost(&net.h_out, 300 * 6 * sizeof(float)));
+  CK(cudaMallocHost(&net.h_cnt, sizeof(int)));
   // attention scratch sized from the graph (heads varies by model scale)
   int maxheads = 0, maxN = 0, maxhd = 64;
   for (const Op& op : net.ops)
@@ -1009,7 +1014,12 @@ static void runOp(Net& net, const Op& op, cudaStream_t st) {
         bool wide = (op.k == 3) && M >= 1600 && op.Cout >= 128 && bwide >= 38;
         if (wide)                                 LAUNCH_TILE(64, 128, 3, 2, 4);
         else if (op.Cout <= 32 && M >= 6400)      LAUNCH_TILE(64, 32, 3, 2, 2);
-        else if (b64 >= 24)                       LAUNCH_TILE(64, 64, 3, 2, 2);
+        else if (b64 >= 24) {
+          // 8-warp grid hides barrier/wait stalls on some shapes; autotuner picks per op
+          bool w8 = op.variant ? (op.variant == 2) : (kone || M > 400);
+          if (w8) LAUNCH_TILE(64, 64, 3, 2, 4);
+          else    LAUNCH_TILE(64, 64, 3, 2, 2);
+        }
         else                                      LAUNCH_TILE(32, 32, 3, 2, 2);
 #undef LAUNCH_TILE
       } else if (op.g == 1)
@@ -1103,6 +1113,8 @@ static void forward(Net& net, cudaStream_t st) {
   CK(cudaMemsetAsync(net.detcnt, 0, sizeof(int), st));
   for (auto& op : net.ops) runOp(net, op, st);
   k_nms<<<1, 256, 0, st>>>(net.dets, net.detcnt, net.outdets, net.outcnt, 0.45f);
+  CK(cudaMemcpyAsync(net.h_cnt, net.outcnt, sizeof(int), cudaMemcpyDeviceToHost, st));
+  CK(cudaMemcpyAsync(net.h_out, net.outdets, 300 * 6 * sizeof(float), cudaMemcpyDeviceToHost, st));
 }
 
 // fuse CONV + following ADD (residual) into the conv epilogue
@@ -1123,6 +1135,35 @@ static void fuseAdds(Net& net) {
   }
   net.ops = out;
   printf("fused %d ADDs into conv epilogues (%zu ops remain)\n", fused, net.ops.size());
+}
+
+// startup autotune: time both (64,64) warp-grid variants per conv, keep the winner
+static void autotune(Net& net, cudaStream_t st) {
+  cudaEvent_t e0, e1; cudaEventCreate(&e0); cudaEventCreate(&e1);
+  int tuned = 0, wide8 = 0;
+  for (auto& op : net.ops) {
+    if (op.kind != CONV || op.g != 1 || op.Cin < 8) continue;
+    View y = view(net, op.out);
+    int M = y.H * y.W;
+    int b64 = ((M + 63) / 64) * ((op.Cout + 63) / 64);
+    int bwide = ((M + 63) / 64) * ((op.Cout + 127) / 128);
+    bool wide = (op.k == 3) && M >= 1600 && op.Cout >= 128 && bwide >= 38;
+    if ((op.Cout <= 32 && M >= 6400) || wide || b64 < 24) continue;  // not the (64,64) branch
+    float t[2];
+    for (int v = 1; v <= 2; v++) {
+      op.variant = v;
+      runOp(net, op, st);                       // warm
+      cudaEventRecord(e0, st);
+      for (int r = 0; r < 8; r++) runOp(net, op, st);
+      cudaEventRecord(e1, st);
+      CK(cudaStreamSynchronize(st));
+      cudaEventElapsedTime(&t[v - 1], e0, e1);
+    }
+    op.variant = (t[0] <= t[1]) ? 1 : 2;
+    tuned++; wide8 += op.variant == 2;
+  }
+  cudaEventDestroy(e0); cudaEventDestroy(e1);
+  printf("autotuned %d convs (%d chose 8-warp grid)\n", tuned, wide8);
 }
 
 // ------------------------- CPU NMS -------------------------
@@ -1150,12 +1191,14 @@ static std::vector<Det> nms(std::vector<Det> v, float thr) {
 
 // NMS ran on the GPU inside the graph; just fetch the compacted results.
 static std::vector<Det> fetchNMS(Net& net, cudaStream_t st) {
-  int cnt; CK(cudaMemcpy(&cnt, net.outcnt, sizeof(int), cudaMemcpyDeviceToHost));
-  std::vector<float> d(cnt * 6);
-  CK(cudaMemcpy(d.data(), net.outdets, cnt * 6 * sizeof(float), cudaMemcpyDeviceToHost));
+  // results were copied into pinned host memory inside the graph; stream is already synced
+  (void)st;
+  int cnt = *net.h_cnt;
   std::vector<Det> v;
-  for (int i = 0; i < cnt; i++)
-    v.push_back({d[i*6], d[i*6+1], d[i*6+2], d[i*6+3], d[i*6+4], (int)d[i*6+5]});
+  for (int i = 0; i < cnt; i++) {
+    const float* d = net.h_out + i * 6;
+    v.push_back({d[0], d[1], d[2], d[3], d[4], (int)d[5]});
+  }
   return v;
 }
 
@@ -1212,6 +1255,7 @@ int main(int argc, char** argv) {
   cudaStream_t st; CK(cudaStreamCreate(&st));
   CK(cudaFuncSetAttribute(k_attn_qk, cudaFuncAttributeMaxDynamicSharedMemorySize, 99 * 1024));
   CK(cudaFuncSetAttribute(k_attn_av, cudaFuncAttributeMaxDynamicSharedMemorySize, 99 * 1024));
+  if (mode != "dump" && !getenv("NOTUNE")) autotune(net, st);
 
   auto makeGraph = [&](cudaGraphExec_t& gexec) {
     cudaGraph_t graph;
