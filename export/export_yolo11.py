@@ -9,7 +9,7 @@ Outputs (in build/<model>[-S]/):
   bias.f32      - all conv biases, fp32
   input.f16     - preprocessed input image, NHWC fp16 (SxSx3)
   ref/op{k}.npy - reference output of every op (fp32, NHWC view contents)
-  ref/final.npy - ultralytics head output [1, 4+nc, A], A = 21*(S/32)^2
+  ref/final.npy - ultralytics output: detect [1, 4+nc, A] (A=21*(S/32)^2), cls [1, nc] probs
 
 Two-level verification:
   1. torch interpreter over the exported graph vs ultralytics module hooks
@@ -128,6 +128,26 @@ class Graph:
 
     def decode(self, box, cls, stride):
         self.ops.append(('DECODE', box, cls, stride))
+
+    def gap(self, x, out):
+        H, W, C = self.shape(x)
+        assert self.shape(out) == (1, 1, C)
+        self.ops.append(('GAP', x, out)); return out
+
+    def softmax(self, x, out):
+        assert self.shape(x) == self.shape(out)
+        self.ops.append(('SOFTMAX', x, out)); return out
+
+    def linear(self, x, mod, out=None):
+        """nn.Linear as a 1x1 CONV on a [1,1,I] tensor (M = B GEMM, reuses k_conv_mma KONE)."""
+        O, I = mod.weight.shape
+        assert self.shape(x) == (1, 1, I)
+        if out is None:
+            out = self.newt(1, 1, O)
+        w = mod.weight.detach().numpy().reshape(O, 1, 1, I)   # OHWI, k=1 => no permute needed
+        woff, boff = self.add_weight(w, mod.bias.detach().numpy())
+        self.ops.append(('CONV', x, out, 1, 1, 0, 1, ACT_NONE, I, O, woff, boff))
+        return out
 
 
 # ---------------- module decomposition ----------------
@@ -287,6 +307,29 @@ def build(net, g, S):
         g.det_ref.append((b, c))
     return g
 
+def build_cls(net, g, S):
+    """Classification: detect backbone layers 0..N-2 (all f=-1 sequential) + Classify head."""
+    x = g.newt(S, S, 3)  # tensor 0 = input
+    for i in range(len(net) - 1):
+        mod = net[i]
+        if isinstance(mod, uconv.Conv):
+            x = g.conv(x, mod)
+        elif isinstance(mod, ublock.C3k2):
+            x = c3k2(g, x, mod)
+        elif isinstance(mod, ublock.C2PSA):
+            x = c2psa(g, x, mod)
+        else:
+            raise RuntimeError(type(mod))
+        g.layer_out[i] = x
+    head = net[-1]                          # Classify: conv 1x1 SiLU -> GAP -> linear -> softmax
+    h = g.conv(x, head.conv)                # Dropout p=0.0 is an eval no-op: not emitted
+    _, _, C = g.shape(h)
+    gp = g.gap(h, g.newt(1, 1, C))
+    logits = g.linear(gp, head.linear)
+    probs = g.softmax(logits, g.newt(1, 1, head.linear.out_features))
+    g.layer_out[len(net) - 1] = probs
+    return g
+
 
 # ---------------- torch interpreter (reference) ----------------
 
@@ -328,6 +371,10 @@ def run_reference(g, x_nchw, dump=True, fp32_weights=False):
             att = att.softmax(dim=-1)
             y = (v_ @ att.transpose(-2, -1)).reshape(C, H, W)
             wr(out, y)
+        elif kind == 'GAP':
+            _, x, out = op; wr(out, rd(x).mean(dim=(1, 2), keepdim=True))
+        elif kind == 'SOFTMAX':
+            _, x, out = op; wr(out, rd(x).softmax(dim=0))   # channel dim of [C,1,1]
         elif kind == 'DECODE':
             _, box, cls, st = op
             dets.append((rd(box).clone(), rd(cls).clone(), st))
@@ -341,6 +388,19 @@ def run_reference(g, x_nchw, dump=True, fp32_weights=False):
             np.save(f'{BUILD}/ref/op{k:03d}.npy', v)
     return bufs, dets
 
+
+def classify_input(S):
+    """torchvision-exact cls preprocessing (resize shortest edge + center crop, /255 RGB);
+    NOT letterbox — mean/std are 0/1 in ultralytics classify_transforms."""
+    import cv2
+    from PIL import Image
+    from ultralytics.data.augment import classify_transforms
+    from ultralytics.utils import ASSETS
+    img = cv2.imread(str(ASSETS / 'bus.jpg'))
+    img.tofile(BUILD + '/bus_raw.u8')
+    open(BUILD + '/bus_raw.txt', 'w').write(f'{img.shape[0]} {img.shape[1]}')
+    x = classify_transforms(S)(Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB)))
+    return x[None].float()  # 1,3,S,S fp32
 
 def letterbox_input(S):
     import cv2
@@ -365,8 +425,9 @@ def main():
     model.fuse()
     net = model.model
 
-    task = getattr(m, 'task', 'detect') or 'detect'
-    nc = len(model.names)
+    task = 'classify' if isinstance(net[-1], uhead.Classify) else 'detect'
+    # cls checkpoints carry a stale detect nc=80 in model.yaml; the linear layer is the truth
+    nc = net[-1].linear.out_features if task == 'classify' else len(model.names)
     try:
         default_sz = int(model.args['imgsz'])   # train imgsz carried in the checkpoint
     except Exception:
@@ -381,7 +442,10 @@ def main():
     print(f'task={task} nc={nc} imgsz={S} -> {BUILD}')
 
     g = Graph()
-    build(net, g, S)
+    if task == 'classify':
+        build_cls(net, g, S)
+    else:
+        build(net, g, S)
     nconv = sum(1 for o in g.ops if o[0] == 'CONV')
     print(f'ops={len(g.ops)} convs={nconv} bufs={len(g.bufs)} tens={len(g.tens)}')
     print(f'weights: {g.woff} fp16 elems, bias {g.boff} fp32')
@@ -389,14 +453,19 @@ def main():
     print(f'activation memory: {act_bytes/1e6:.1f} MB (fp16, no reuse)')
 
     # input
-    rgb, _ = letterbox_input(S)
-    x = torch.from_numpy(rgb.transpose(2, 0, 1)[None].copy())  # 1,3,S,S
-    rgb.astype(np.float16).tofile(BUILD + '/input.f16')        # NHWC fp16
+    if task == 'classify':
+        x = classify_input(S)                                  # 1,3,S,S
+        x[0].permute(1, 2, 0).numpy().astype(np.float16).tofile(BUILD + '/input.f16')  # NHWC fp16
+    else:
+        rgb, _ = letterbox_input(S)
+        x = torch.from_numpy(rgb.transpose(2, 0, 1)[None].copy())  # 1,3,S,S
+        rgb.astype(np.float16).tofile(BUILD + '/input.f16')        # NHWC fp16
 
-    # ultralytics reference with hooks
+    # ultralytics reference with hooks (classify: incl. the head; detect: 0..22, head via final)
+    nhook = len(net) if task == 'classify' else len(net) - 1
     caps = {}
     hooks = []
-    for i in range(23):
+    for i in range(nhook):
         hooks.append(net[i].register_forward_hook(lambda mo, inp, out, i=i: caps.__setitem__(i, out)))
     y = model(x)
     y = y[0] if isinstance(y, (tuple, list)) else y
@@ -412,12 +481,13 @@ def main():
     # level-1 verification: decomposition vs ultralytics hooks
     print('--- decomposition check (max abs diff vs ultralytics) ---')
     worst = 0
-    for i in range(23):
+    for i in range(nhook):
         t = g.layer_out[i]
         b, coff, C = g.tens[t]
         mine = bufs[b][coff:coff + C]
+        # Classify's eval hook output is a (probs, logits) tuple; compare probs
         refv = caps[i][0] if not isinstance(caps[i], (tuple, list)) else caps[i][0][0]
-        d = (mine - refv).abs().max().item()
+        d = (mine.reshape(-1) - refv.reshape(-1)).abs().max().item()
         worst = max(worst, d)
         print(f'layer {i:2d}: {d:.3e}')
     print('WORST', worst)
@@ -439,6 +509,16 @@ def main():
             f.write(' '.join(str(v) for v in op) + '\n')
     np.concatenate(g.w16).tofile(BUILD + '/weights.f16')
     np.concatenate(g.b32).tofile(BUILD + '/bias.f32')
+
+    if task == 'classify':
+        # names for the CLI top-5 print; remap ImageNet synset ids to words (AutoBackend does this)
+        names = dict(model.names)
+        if isinstance(names[0], str) and names[0].startswith('n0'):
+            from ultralytics.utils import ROOT as UROOT, YAML
+            nm = YAML.load(UROOT / 'cfg/datasets/ImageNet.yaml')['map']
+            names = {k: nm[v] for k, v in names.items()}
+        with open(BUILD + '/names.txt', 'w') as f:
+            f.write('\n'.join(names[i] for i in range(len(names))) + '\n')
     print('wrote model.graph / weights.f16 / bias.f32 / input.f16')
 
 if __name__ == '__main__':

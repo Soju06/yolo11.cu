@@ -12,6 +12,8 @@ void* yolo_create(const char* model_dir, int max_batch);
 float yolo_exec_ms(void* h, int B);
 cudaStream_t yolo_stream(void* h);
 // Letterbox+normalize a device BGR u8 HWC image into batch slot `slot` (async on engine stream).
+// Detect-only: classify models need resize-shortest+center-crop, not letterbox — do not use
+// this (or the detect getters below) on a classify model dir.
 void yolo_preprocess(void* h, const unsigned char* dev_bgr, int height, int width, int slot);
 // Launch the batch-B graph and synchronize. Results are in pinned host memory afterwards.
 void yolo_run(void* h, int B);

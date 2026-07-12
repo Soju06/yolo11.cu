@@ -10,3 +10,5 @@ server/yolo.grpc.pb.*
 engine_lib.o
 yolo11serve
 nohup.out
+/bus.jpg
+/boats.jpg

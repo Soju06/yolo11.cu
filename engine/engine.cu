@@ -23,7 +23,7 @@
 // ------------------------- graph structures -------------------------
 struct Buf  { int H, W, C; __half* p = nullptr; };
 struct Ten  { int buf, coff, C; };
-enum OpKind { CONV, ADD, MAXPOOL5, UPSAMPLE2, COPYC, ATTN, DECODE };
+enum OpKind { CONV, ADD, MAXPOOL5, UPSAMPLE2, COPYC, ATTN, DECODE, GAP, SOFTMAX };
 struct Op {
   OpKind kind;
   int a = -1, b = -1, out = -1;        // tensor ids (CONV: a=in, out; ADD: a,b,out)
@@ -39,6 +39,9 @@ struct Net {
   int inH = 0, inW = 0;        // input size (graph tensor 0; v2 header cross-checks it)
   int nc = 80;                 // class count (v2 header; v1 default)
   char task[16] = "detect";    // v2 header; v1 default
+  int cls = 0;                 // task == "classify"
+  int probsTen = -1;           // classify: SOFTMAX output tensor (standalone [1,1,nc] buffer)
+  __half* h_probs = nullptr;   // pinned host probs [B][nc] (copied inside the graph)
   std::vector<Buf> bufs;
   std::vector<Ten> tens;
   std::vector<Op> ops;
@@ -101,6 +104,10 @@ static void loadGraph(Net& net, const std::string& dir) {
       op.kind = ATTN; if (fscanf(f, "%d %d %d %d %d", &op.a, &op.out, &op.heads, &op.kd, &op.hd) != 5) exit(1);
     } else if (!strcmp(tag, "DECODE")) {
       op.kind = DECODE; if (fscanf(f, "%d %d %d", &op.a, &op.b, &op.stride) != 3) exit(1);
+    } else if (!strcmp(tag, "GAP")) {
+      op.kind = GAP; if (fscanf(f, "%d %d", &op.a, &op.out) != 2) exit(1);
+    } else if (!strcmp(tag, "SOFTMAX")) {
+      op.kind = SOFTMAX; if (fscanf(f, "%d %d", &op.a, &op.out) != 2) exit(1);
     } else { fprintf(stderr, "bad op %s\n", tag); exit(1); }
     net.ops.push_back(op);
   }
@@ -118,6 +125,20 @@ static void loadGraph(Net& net, const std::string& dir) {
       fprintf(stderr, "DECODE needs nc %% 8 == 0 and cls view C == nc (nc=%d, C=%d)\n",
               net.nc, net.tens[op.b].C); exit(1);
     }
+
+  net.cls = !strcmp(net.task, "classify");
+  if (net.cls) {
+    for (const Op& op : net.ops)
+      if (op.kind == SOFTMAX) net.probsTen = op.out;
+    if (net.probsTen < 0) { fprintf(stderr, "classify graph without SOFTMAX\n"); exit(1); }
+    // the D2H copy and k_softmax_ch index images at buffer stride: must be a standalone
+    // full-width [1,1,nc] buffer (coff 0, view C == buffer C)
+    const Ten& t = net.tens[net.probsTen]; const Buf& b = net.bufs[t.buf];
+    if (t.coff || t.C != b.C || b.H != 1 || b.W != 1 || t.C != net.nc) {
+      fprintf(stderr, "probs tensor must be a standalone [1,1,nc] buffer\n"); exit(1);
+    }
+    CK(cudaMallocHost(&net.h_probs, (size_t)net.B * net.nc * sizeof(__half)));
+  }
 
   for (auto& b : net.bufs) CK(cudaMalloc(&b.p, (size_t)net.B * b.H * b.W * b.C * sizeof(__half)));
   for (auto& b : net.bufs) CK(cudaMemset(b.p, 0, (size_t)net.B * b.H * b.W * b.C * sizeof(__half)));
@@ -634,6 +655,55 @@ __global__ void k_copyc(const __half* X, int xs, int xo, __half* Y, int ys, int 
   Y[(size_t)pix * ys + yo + c] = X[(size_t)pix * xs + xo + c];
 }
 
+// global average pool: [H,W,C] view -> [1,1,C] view, mean over H*W. fp32 accumulate.
+__global__ void k_gap(const __half* __restrict__ X, int xs, int xo,
+                      __half* __restrict__ Y, int ys, int yo, int HW, int C, int Bn) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;   // Bn*C threads
+  if (idx >= Bn * C) return;
+  int c = idx % C, img = idx / C;
+  const __half* x = X + (size_t)img * HW * xs + xo + c;
+  float s = 0.f;
+  for (int p = 0; p < HW; p++) s += __half2float(x[(size_t)p * xs]);
+  Y[(size_t)img * ys + yo + c] = __float2half(s / HW);
+}
+
+// channel softmax on a [1,1,C] view; one block per image; fp32 math, fp16 out.
+// not in-place: the dump compares both the logits CONV out and the probs.
+__global__ void k_softmax_ch(const __half* __restrict__ X, int xs, int xo,
+                             __half* __restrict__ Y, int ys, int yo, int C) {
+  const __half* x = X + (size_t)blockIdx.x * xs + xo;   // H*W == 1 -> image stride == xs
+  __half* y = Y + (size_t)blockIdx.x * ys + yo;
+  __shared__ float red[32];
+  const int tid = threadIdx.x;
+  float lmax = -1e30f;
+  for (int c = tid; c < C; c += blockDim.x) lmax = fmaxf(lmax, __half2float(x[c]));
+  for (int o = 16; o > 0; o >>= 1) lmax = fmaxf(lmax, __shfl_down_sync(~0u, lmax, o));
+  if ((tid & 31) == 0) red[tid >> 5] = lmax;
+  __syncthreads();
+  if (tid < 32) {
+    float v = tid < (blockDim.x + 31) / 32 ? red[tid] : -1e30f;
+    for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_down_sync(~0u, v, o));
+    if (tid == 0) red[0] = v;
+  }
+  __syncthreads();
+  float gmax = red[0];
+  __syncthreads();
+  float lsum = 0.f;
+  for (int c = tid; c < C; c += blockDim.x) lsum += expf(__half2float(x[c]) - gmax);
+  for (int o = 16; o > 0; o >>= 1) lsum += __shfl_down_sync(~0u, lsum, o);
+  if ((tid & 31) == 0) red[tid >> 5] = lsum;
+  __syncthreads();
+  if (tid < 32) {
+    float v = tid < (blockDim.x + 31) / 32 ? red[tid] : 0.f;
+    for (int o = 16; o > 0; o >>= 1) v += __shfl_down_sync(~0u, v, o);
+    if (tid == 0) red[0] = v;
+  }
+  __syncthreads();
+  float inv = 1.f / red[0];
+  for (int c = tid; c < C; c += blockDim.x)
+    y[c] = __float2half(expf(__half2float(x[c]) - gmax) * inv);
+}
+
 // attention: qkv buffer [N tokens, heads*(2kd+hd)] strided; out [N, heads*hd].
 // one block per (token, head, image); scores in smem. Correct for any N (mma fallback).
 __global__ void k_attn(const __half* __restrict__ QKV, int qs, int qo,
@@ -775,6 +845,54 @@ __global__ void k_preprocess(const uint8_t* __restrict__ src, int sh, int sw,
   o[0] = __float2half(r / 255.f);   // RGB order
   o[1] = __float2half(g / 255.f);
   o[2] = __float2half(b / 255.f);
+}
+
+// classify preprocess: BGR u8 HWC (sh x sw) -> RGB fp16 NHWC (S x S), /255.
+// torchvision path: resize shortest edge to S with PIL-style ANTIALIASED bilinear
+// (triangle filter, support widens by the scale on downscale — plain bilinear diverges),
+// then center-crop S x S. rh/rw = resized dims, top/left = crop offsets (host-computed).
+__global__ void k_preprocess_cls(const uint8_t* __restrict__ src, int sh, int sw,
+                                 __half* __restrict__ dst, int S,
+                                 int rh, int rw, int top, int left) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= S * S) return;
+  int x = idx % S, y = idx / S;
+  float scy = (float)sh / rh, scx = (float)sw / rw;   // per-axis src/resized scale
+  float supy = fmaxf(scy, 1.f), supx = fmaxf(scx, 1.f);
+  float cy = (y + top + 0.5f) * scy, cx = (x + left + 0.5f) * scx;
+  int y0 = max(0, (int)(cy - supy + 0.5f)), y1 = min(sh, (int)(cy + supy + 0.5f));
+  int x0 = max(0, (int)(cx - supx + 0.5f)), x1 = min(sw, (int)(cx + supx + 0.5f));
+  float wysum = 0.f, wxsum = 0.f;
+  for (int i = y0; i < y1; i++) wysum += fmaxf(0.f, 1.f - fabsf(i + 0.5f - cy) / supy);
+  for (int j = x0; j < x1; j++) wxsum += fmaxf(0.f, 1.f - fabsf(j + 0.5f - cx) / supx);
+  float b = 0.f, g = 0.f, r = 0.f;
+  for (int i = y0; i < y1; i++) {
+    float wy = fmaxf(0.f, 1.f - fabsf(i + 0.5f - cy) / supy);
+    const uint8_t* row = src + (size_t)i * sw * 3;
+    for (int j = x0; j < x1; j++) {
+      float w = wy * fmaxf(0.f, 1.f - fabsf(j + 0.5f - cx) / supx);
+      const uint8_t* p = row + (size_t)j * 3;
+      b += w * p[0]; g += w * p[1]; r += w * p[2];
+    }
+  }
+  float inv = 1.f / (wysum * wxsum * 255.f);
+  __half* o = dst + (size_t)idx * 3;
+  o[0] = __float2half(r * inv);   // RGB order
+  o[1] = __float2half(g * inv);
+  o[2] = __float2half(b * inv);
+}
+
+// host-side torchvision geometry: shortest edge -> S (int() truncation of the long edge),
+// center crop with python round-half-to-even offsets
+struct ClsGeom { int rh, rw, top, left; };
+static ClsGeom clsGeom(int S, int sh, int sw) {
+  long rh, rw;
+  if (sw <= sh) { rw = S; rh = (long)S * sh / sw; }
+  else          { rh = S; rw = (long)S * sw / sh; }
+  int dy = (int)rh - S, dx = (int)rw - S;
+  int top  = dy / 2 + ((dy & 1) && ((dy / 2) & 1));
+  int left = dx / 2 + ((dx & 1) && ((dx / 2) & 1));
+  return { (int)rh, (int)rw, top, left };
 }
 
 // single-block GPU NMS: bitonic sort by score, greedy suppression, compacted output.
@@ -1003,12 +1121,30 @@ static void runOp(Net& net, const Op& op, cudaStream_t st, int Bn) {
           b.H, b.W, op.stride, 0.25f, net.dets, net.detcnt, Net::MAXDET, net.nc, Bn);
       break;
     }
+    case GAP: {
+      View x = view(net, op.a), y = view(net, op.out);
+      int total = Bn * x.C;
+      k_gap<<<(total + TB - 1) / TB, TB, 0, st>>>(x.p, x.s, x.o, (__half*)y.p, y.s, y.o,
+                                                  x.H * x.W, x.C, Bn);
+      break;
+    }
+    case SOFTMAX: {
+      View x = view(net, op.a), y = view(net, op.out);
+      k_softmax_ch<<<Bn, 256, 0, st>>>(x.p, x.s, x.o, (__half*)y.p, y.s, y.o, x.C);
+      break;
+    }
   }
 }
 
 static void forward(Net& net, cudaStream_t st, int Bn) {
-  CK(cudaMemsetAsync(net.detcnt, 0, Bn * sizeof(int), st));
+  if (!net.cls) CK(cudaMemsetAsync(net.detcnt, 0, Bn * sizeof(int), st));
   for (auto& op : net.ops) runOp(net, op, st, Bn);
+  if (net.cls) {   // no decode/NMS: D2H the softmax probs (dets/detcnt hold garbage)
+    View p = view(net, net.probsTen);
+    CK(cudaMemcpyAsync(net.h_probs, p.p, (size_t)Bn * net.nc * sizeof(__half),
+                       cudaMemcpyDeviceToHost, st));
+    return;
+  }
   k_nms<<<Bn, 256, 0, st>>>(net.dets, net.detcnt, net.outdets, net.outcnt, 0.45f, Net::MAXDET);
   CK(cudaMemcpyAsync(net.h_rawcnt, net.detcnt, Bn * sizeof(int), cudaMemcpyDeviceToHost, st));
   CK(cudaMemcpyAsync(net.h_cnt, net.outcnt, Bn * sizeof(int), cudaMemcpyDeviceToHost, st));
@@ -1086,6 +1222,54 @@ static std::vector<Det> fetchNMS(Net& net, int img = 0) {
     v.push_back({d[0], d[1], d[2], d[3], d[4], (int)d[5]});
   }
   return v;
+}
+
+// ------------------------- classify CLI output -------------------------
+static std::vector<std::string> loadNames(const std::string& dir) {
+  std::vector<std::string> v;
+  FILE* f = fopen((dir + "/names.txt").c_str(), "r");
+  if (!f) return v;   // optional: print bare class ids when absent
+  char line[256];
+  while (fgets(line, sizeof line, f)) { line[strcspn(line, "\r\n")] = 0; v.push_back(line); }
+  fclose(f);
+  return v;
+}
+
+// partial top-k over the pinned fp16 probs of batch slot img (insertion into k slots)
+static void topk(const Net& net, int img, int k, int* cls, float* prob) {
+  const __half* p = net.h_probs + (size_t)img * net.nc;
+  for (int i = 0; i < k; i++) { cls[i] = -1; prob[i] = -1.f; }
+  for (int c = 0; c < net.nc; c++) {
+    float v = __half2float(p[c]);
+    for (int i = 0; i < k; i++)
+      if (v > prob[i]) {
+        for (int j = k - 1; j > i; j--) { prob[j] = prob[j - 1]; cls[j] = cls[j - 1]; }
+        prob[i] = v; cls[i] = c;
+        break;
+      }
+  }
+}
+
+static void printCls(const Net& net, const std::string& dir) {
+  auto names = loadNames(dir);
+  int cls[5]; float prob[5];
+  if (net.B > 1) {   // batched self-consistency: every image got identical input
+    printf("batch=%d per-image top1:", net.B);
+    bool same = true;
+    int c0 = -1;
+    for (int b = 0; b < net.B; b++) {
+      topk(net, b, 1, cls, prob);
+      if (b == 0) c0 = cls[0];
+      same &= cls[0] == c0;
+      printf(" %d/%.4f", cls[0], prob[0]);
+    }
+    printf("  %s\n", same ? "(consistent)" : "(MISMATCH!)");
+  }
+  topk(net, 0, 5, cls, prob);
+  printf("top5:\n");
+  for (int i = 0; i < 5; i++)
+    printf("%4d %-24s %.4f\n", cls[i],
+           cls[i] >= 0 && cls[i] < (int)names.size() ? names[cls[i]].c_str() : "?", prob[i]);
 }
 
 // load any image via stb_image as BGR u8 HWC (the layout k_preprocess expects)
@@ -1262,21 +1446,29 @@ int main(int argc, char** argv) {
     printf("dumped %zu ops\n", net.ops.size());
   } else if (mode == "detect") {
     float scale = 1.f; int top = 0, left = 0;
-    if (!image.empty()) {   // arbitrary image via stb_image + GPU letterbox
+    if (!image.empty()) {   // arbitrary image via stb_image + GPU preprocess
       int sh, sw;
       uint8_t* img = loadImageBGR(image, sh, sw);
       uint8_t* dimg; CK(cudaMalloc(&dimg, (size_t)sh * sw * 3));
       CK(cudaMemcpy(dimg, img, (size_t)sh * sw * 3, cudaMemcpyHostToDevice));
       stbi_image_free(img);
-      scale = std::min((float)ib.H / sh, (float)ib.W / sw);
-      int nh = (int)roundf(sh * scale), nw = (int)roundf(sw * scale);
-      top = (ib.H - nh) / 2; left = (ib.W - nw) / 2;
-      k_preprocess<<<(ib.H * ib.W + 255) / 256, 256, 0, st>>>(
-          dimg, sh, sw, ib.p, ib.H, ib.W, scale, top, left, nh, nw);
+      if (net.cls) {   // resize-shortest + center crop (all batch slots, keeps them consistent)
+        ClsGeom gm = clsGeom(ib.H, sh, sw);
+        for (int b = 0; b < net.B; b++)
+          k_preprocess_cls<<<(ib.H * ib.W + 255) / 256, 256, 0, st>>>(
+              dimg, sh, sw, ib.p + (size_t)b * ib.H * ib.W * ib.C, ib.H, gm.rh, gm.rw, gm.top, gm.left);
+      } else {         // letterbox
+        scale = std::min((float)ib.H / sh, (float)ib.W / sw);
+        int nh = (int)roundf(sh * scale), nw = (int)roundf(sw * scale);
+        top = (ib.H - nh) / 2; left = (ib.W - nw) / 2;
+        k_preprocess<<<(ib.H * ib.W + 255) / 256, 256, 0, st>>>(
+            dimg, sh, sw, ib.p, ib.H, ib.W, scale, top, left, nh, nw);
+      }
     }
     forward(net, st, net.B);
     CK(cudaStreamSynchronize(st));
     CK(cudaGetLastError());
+    if (net.cls) { printCls(net, dir); return 0; }
     auto keep = fetchNMS(net);
     if (net.B > 1) {   // batched self-consistency: every image got identical input
       printf("batch=%d per-image kept:", net.B);
@@ -1305,11 +1497,17 @@ int main(int argc, char** argv) {
     int nh = (int)roundf(sh * scale), nw = (int)roundf(sw * scale);
     int top = (inb.H - nh) / 2, left = (inb.W - nw) / 2;
 
+    ClsGeom gm = clsGeom(inb.H, sh, sw);   // classify: torchvision resize+crop geometry
+
     cudaGraph_t graph; cudaGraphExec_t gexec;
     CK(cudaStreamBeginCapture(st, cudaStreamCaptureModeGlobal));
     CK(cudaMemcpyAsync(dimg, himg, raw.size(), cudaMemcpyHostToDevice, st));
-    k_preprocess<<<(inb.H * inb.W + 255) / 256, 256, 0, st>>>(
-        dimg, sh, sw, inb.p, inb.H, inb.W, scale, top, left, nh, nw);
+    if (net.cls)
+      k_preprocess_cls<<<(inb.H * inb.W + 255) / 256, 256, 0, st>>>(
+          dimg, sh, sw, inb.p, inb.H, gm.rh, gm.rw, gm.top, gm.left);
+    else
+      k_preprocess<<<(inb.H * inb.W + 255) / 256, 256, 0, st>>>(
+          dimg, sh, sw, inb.p, inb.H, inb.W, scale, top, left, nh, nw);
     forward(net, st, net.B);
     CK(cudaStreamEndCapture(st, &graph));
     CK(cudaGraphInstantiate(&gexec, graph, 0));
@@ -1318,23 +1516,27 @@ int main(int argc, char** argv) {
     CK(cudaGraphLaunch(gexec, st));
     CK(cudaStreamSynchronize(st));
     CK(cudaGetLastError());
-    auto keep = fetchNMS(net);
-    printf("kept=%zu\n", keep.size());
-    for (auto& d : keep)
-      printf("cls=%2d score=%.4f box=(%.1f, %.1f, %.1f, %.1f)\n", d.cls, d.sc, d.x1, d.y1, d.x2, d.y2);
+    if (net.cls) {
+      printCls(net, dir);
+    } else {
+      auto keep = fetchNMS(net);
+      printf("kept=%zu\n", keep.size());
+      for (auto& d : keep)
+        printf("cls=%2d score=%.4f box=(%.1f, %.1f, %.1f, %.1f)\n", d.cls, d.sc, d.x1, d.y1, d.x2, d.y2);
+    }
 
     int iters = iterArg > 0 ? iterArg : 300;
-    for (int i = 0; i < 20; i++) { CK(cudaGraphLaunch(gexec, st)); CK(cudaStreamSynchronize(st)); fetchNMS(net); }
-    auto t0 = std::chrono::steady_clock::now();
-    for (int i = 0; i < iters; i++) {
+    std::chrono::steady_clock::time_point t0;
+    for (int i = 0; i < 20 + iters; i++) {   // 20 warmup iters, then timed
+      if (i == 20) t0 = std::chrono::steady_clock::now();
       CK(cudaGraphLaunch(gexec, st));
       CK(cudaStreamSynchronize(st));
-      fetchNMS(net);
+      if (!net.cls) fetchNMS(net);   // classify results land in pinned h_probs inside the graph
     }
     auto t1 = std::chrono::steady_clock::now();
     double ms = std::chrono::duration<double, std::milli>(t1 - t0).count() / iters;
-    printf("end-to-end pipeline (H2D + preprocess + net + decode + NMS): %.3f ms/frame (%.1f fps)\n",
-           ms, 1000.0 / ms);
+    printf("end-to-end pipeline (H2D + preprocess + net + %s): %.3f ms/frame (%.1f fps)\n",
+           net.cls ? "probs D2H" : "decode + NMS", ms, 1000.0 / ms);
   } else if (mode == "profile") {
     int iters = 50;
     std::vector<float> acc(net.ops.size(), 0.f);
@@ -1355,7 +1557,8 @@ int main(int argc, char** argv) {
         acc[k] += ms;
       }
     }
-    const char* names[] = {"CONV", "ADD", "MAXPOOL5", "UPSAMPLE2", "COPYC", "ATTN", "DECODE"};
+    const char* names[] = {"CONV", "ADD", "MAXPOOL5", "UPSAMPLE2", "COPYC", "ATTN", "DECODE",
+                           "GAP", "SOFTMAX"};
     std::vector<int> order(net.ops.size());
     for (size_t i = 0; i < order.size(); i++) order[i] = i;
     std::sort(order.begin(), order.end(), [&](int a, int b) { return acc[a] > acc[b]; });
