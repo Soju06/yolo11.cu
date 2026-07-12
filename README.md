@@ -1,4 +1,4 @@
-# yolo11-cuda
+# yolo11.cu
 
 A YOLO11 inference engine written entirely in hand-rolled CUDA kernels — **no cuDNN, no cuBLAS, no TensorRT**.
 
