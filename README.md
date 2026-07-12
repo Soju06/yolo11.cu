@@ -1,46 +1,80 @@
 # yolo11.cu
 
-A YOLO11 inference engine written entirely in hand-rolled CUDA kernels — **no cuDNN, no cuBLAS, no TensorRT**.
+> **1,100+ FPS object detection on a $400 gaming GPU** — YOLO11, every kernel written by hand in one CUDA file.
 
-Supports YOLO11 n/s/m scales (the exporter derives the graph from the actual model, so other scales work unmodified), 640×640 input, COCO 80 classes. The whole pipeline — preprocessing, network, DFL decode, NMS — runs on the GPU and is captured as a single CUDA graph.
+![CUDA](https://img.shields.io/badge/CUDA-12%2B-76B900?logo=nvidia&logoColor=white)
+![yolo11n](https://img.shields.io/badge/yolo11n-0.90_ms_%2F_1113_fps-e91e63)
+![deps](https://img.shields.io/badge/runtime_deps-zero-blue)
+![license](https://img.shields.io/badge/license-MIT-lightgrey)
 
-Reference hardware: RTX 3060 Ti (Ampere, SM 8.6, 8 GB), CUDA 13.3.
+No cuDNN. No cuBLAS. No TensorRT. No Python at runtime. The entire engine — tensor-core GEMM, attention, preprocessing, decode, NMS — is ~1,200 lines of hand-rolled CUDA in a single `.cu` file, and it beats PyTorch's cuDNN backend by **7×** on the exact same GPU, producing the exact same detections.
 
-## Results
+## How fast?
 
-`bench` = network + decode + NMS, one CUDA-graph launch per frame.
-`pipeline` = end-to-end: raw image H2D → GPU letterbox → network → decode → NMS → results in pinned host memory.
+RTX 3060 Ti, 640×640, fp16 — same weights, same images, matching boxes/classes/scores:
+
+```
+yolo11n, end-to-end (raw image in → boxes out)
+
+ultralytics predict   ██████████████████████████████████████  14.9 ms
+PyTorch fp16 (cuDNN)  ████████████████                         6.3 ms   (net only!)
+yolo11.cu             ███                                      1.21 ms  ← 12× end-to-end
+```
 
 | | yolo11n | yolo11m |
 |---|---|---|
 | ultralytics `predict` (full pipeline) | 14.9 ms | 11.3 ms |
-| PyTorch fp16 eager, net only (cuDNN) | 6.26 ms | 9.57 ms |
-| **this engine, `bench`** | **0.90 ms** (1113 fps) | **3.87 ms** (258 fps) |
-| **this engine, `pipeline` (end-to-end)** | **1.21 ms** (828 fps) | **4.07 ms** (246 fps) |
+| PyTorch fp16 eager, **net only** (cuDNN) | 6.26 ms | 9.57 ms |
+| **yolo11.cu, net + decode + NMS** | **0.90 ms** · 1113 fps | **3.87 ms** · 258 fps |
+| **yolo11.cu, end-to-end** | **1.21 ms** · 828 fps | **4.07 ms** · 246 fps |
 
-Accuracy (max per-op relative error vs a PyTorch fp32 reference): **0.99%** (n) / **1.3%** (m) in the default accumulation mode — on the order of fp16 storage error itself. Detections on the test images match ultralytics in boxes, classes, and scores across all modes.
+*End-to-end* means everything: H2D copy of the raw image, GPU letterboxing, the network, DFL decode, NMS — all captured in **one CUDA graph**, one launch per frame. The host's entire job is `cudaGraphLaunch` + one sync, then reading boxes out of pinned memory.
 
-## Quick start
+And it's not a lossy trick: max per-op deviation from a PyTorch fp32 reference is **0.99%** (n) / **1.3%** (m) — the same order as fp16 rounding itself. Detections match ultralytics on real images in boxes, classes, and scores.
+
+## Try it (60 seconds)
 
 ```bash
-pip install ultralytics          # export-time only; the engine has no Python runtime deps
-make export MODEL=yolo11n        # download weights, build graph + numeric references
-make                             # builds ./yolo11cuda (nvcc, sm_86 by default)
-make test MODEL=yolo11n          # per-op numeric verification + detection check
-
-./yolo11cuda detect build/yolo11n --image photo.jpg   # any jpg/png; boxes in original coords
-./yolo11cuda bench build/yolo11n 300
-./yolo11cuda pipeline build/yolo11n 300
+pip install ultralytics          # export-time only — the binary needs nothing but a GPU
+make export MODEL=yolo11n        # download weights → build graph + numeric references
+make                             # nvcc → ./yolo11cuda
+./yolo11cuda detect build/yolo11n --image your_photo.jpg
 ```
 
-Other scales: `make export MODEL=yolo11m && make test MODEL=yolo11m`.
+```
+$ ./yolo11cuda detect build/yolo11n --image bus.jpg
+kept=5  (boxes in original image coords)
+cls= 5 score=0.9397 box=(12.1, 228.5, 799.3, 735.1)     # bus
+cls= 0 score=0.9021 box=(48.6, 398.0, 243.3, 904.4)     # person
+cls= 0 score=0.8486 box=(670.6, 392.6, 810.0, 879.7)    # person
+cls= 0 score=0.8336 box=(223.1, 405.6, 345.3, 859.8)    # person
+cls= 0 score=0.3989 box=(-0.1, 550.4, 66.2, 871.7)      # person
 
-### CLI
+$ ./yolo11cuda pipeline build/yolo11n
+end-to-end pipeline (H2D + preprocess + net + decode + NMS): 1.21 ms/frame (828 fps)
+```
+
+Want a different scale? `make export MODEL=yolo11m && make test MODEL=yolo11m`. The exporter reads the graph out of the actual ultralytics model — channel widths, attention heads, block layouts — so n/s/m all work from the same code.
+
+## Why is it this fast?
+
+Because nothing is generic. Every kernel knows exactly what network it's running:
+
+- **Implicit GEMM on tensor cores, written in raw PTX** — `mma.sync.m16n8k16` + `cp.async` multistage pipelines, XOR-swizzled shared memory, `ldmatrix`. The GEMM K axis is the flat `(ky, kx, ci)` index (*dense-K packing*): im2col coordinates advance incrementally, thin-channel layers waste zero lanes, and the hot loop contains **zero integer divisions**.
+- **The graph is fused flat.** BatchNorm is folded into weights at export. Every residual `ADD` in the network is absorbed into a conv epilogue (bias + SiLU + residual in registers). Every `split`/`concat` is zero-copy — convs write straight into slices of the concat buffers through strided views.
+- **Attention runs on the conv kernel.** C2PSA's Q·Kᵀ reads the K matrix *in place* from the qkv buffer by treating it as GEMM weights with a stride trick; P·V goes through the same kernel. 8× faster than a dedicated attention kernel we wrote first.
+- **The engine autotunes itself at startup** — for each conv it times 4-warp vs 8-warp tile variants (~tens of ms, once) and keeps the winner, so the dispatch adapts to your GPU instead of trusting a heuristic.
+- **Hybrid fp16-window accumulation** — Ampere runs fp32-accumulate HMMA at half rate, so the default accumulates in fp16 over a bounded K=64 window and flushes to fp32 registers: pure-fp16 speed, near-fp32 accuracy. `ACC16=1` / `ACC32=1` give you the pure modes.
+- **GPU-resident NMS** — bitonic sort sized to the live candidate count + greedy suppression, inside the graph. Nothing crosses PCIe except the final boxes (7 KB, into pinned memory, also inside the graph).
+
+Every claim above is verifiable: `make test` re-derives references from PyTorch fp32 and checks **every single op's output** (109 ops for n, 141 for m), then checks final detections against ultralytics.
+
+## CLI
 
 ```
 yolo11cuda <mode> [model-dir] [iters] [--image path]
 
-  detect     one inference, print detections (--image loads any jpg/png via stb_image)
+  detect     one inference, print detections (--image loads any jpg/png, boxes in original coords)
   bench      net-only benchmark, stream launches vs CUDA graph
   pipeline   end-to-end latency benchmark
   profile    per-op timing breakdown
@@ -53,44 +87,25 @@ env:
   NOFUSE=1   disable residual-add fusion (debugging)
 ```
 
-## How it works
+## Engineering notes — including the failures
 
-**Graph export** (`export/export_yolo11.py`) — loads the ultralytics model, folds BatchNorm into conv weights (`fuse()`), and decomposes C3k2 / C3k / SPPF / C2PSA / Detect into seven primitives: `CONV, ADD, MAXPOOL5, UPSAMPLE2, COPYC, ATTN, DECODE` (n: 112 ops, m: 144 ops). Channel widths and attention head counts are read from the modules, so nothing is hardcoded per scale. Weights are stored fp16 in `[Cout][kh][kw][Cin]` order — which is exactly the k-contiguous B matrix the GEMM kernel wants.
+Everything was accepted or rejected on Nsight Compute / Systems measurements, and the rejects are documented so nobody walks the same dead ends:
 
-**Memory** — NHWC fp16 with *view tensors* (buffer + channel offset + row stride). Every `split`/`chunk`/`concat` in the network is zero-copy: convs write directly into slices of pre-allocated concat buffers.
+- First ncu pass on the big convs: compute 37% / **memory 78–83%** — L2-bandwidth bound on im2col A-tile re-reads. Fixed with wide-N tiles (64×128, 256 threads).
+- Stall profile after that: `math_pipe_throttle` 33%, `barrier` 20%, `wait` 20%, global memory **1.7%** — tensor-pipe bound. That data drove the hybrid accumulation default and the autotuned 8-warp grids (occupancy 33% → 67%).
+- Measured and rejected:
+  - **Two-pass explicit im2col** for stride-2 convs — dense A (29 MB) blows out L2 (4 MB); DRAM round-trips made it *slower* (m: 4.08 → 4.31 ms).
+  - **(64,256) tiles, 2 stages** — shallow pipeline, 1×1 convs 2.3× slower.
+  - **`cp.async.ca`** (L1-cached loads) — shared memory eats the L1 partition; no effect.
+  - **Space-to-depth for stride-2 convs** — mooted by the 1.7% memory-stall measurement before a line was written.
+  - **mbarrier `cuda::pipeline`** — per-stage overhead exceeded the barrier savings (m: 4.10 → 4.75 ms). Reverted.
 
-**Kernels** (`engine/engine.cu`, single file):
-
-- `k_conv_mma` — implicit GEMM on tensor cores: `mma.sync.m16n8k16`, `cp.async` multistage pipeline with a single `__syncthreads` per k-step, XOR-swizzled shared memory + `ldmatrix`. The GEMM K axis is the flat `(ky, kx, ci)` index (*dense-K packing*): per-vec8 im2col coordinates are tracked incrementally, so thin-channel layers waste nothing and the pipeline loop contains zero integer divisions. Epilogue fuses bias + SiLU + residual add (all 14–19 `ADD` ops in the graph are absorbed). Tile variants (64×64, 64×32, 32×32, 64×128 @256 threads; 4-warp and 8-warp grids) are chosen per op — see autotuning below. 1×1 convs take a `KONE` template path that skips im2col entirely.
-- **Attention (C2PSA) reuses the same GEMM kernel**: Q·Kᵀ reads the K matrix in place from the qkv buffer via a weight-stride trick, then a row softmax kernel, then P·V through a small Vᵀ transpose. ~8× faster than the naive attention kernel it replaced.
-- Special-purpose kernels: `k_conv0` (Cin=3 first conv, 16-output-channel chunks per block), `k_dwconv8` (depthwise, weights repacked `[K²][C]` for uint4 channel loads), `k_maxpool5` (`__hmax2`), `k_decode` (DFL softmax-expectation + sigmoid + confidence filter, vectorized), `k_preprocess` (BGR u8 → letterbox bilinear → fp16, matches cv2), `k_nms` (single block: bitonic sort sized to the candidate count + greedy suppression; results match ultralytics NMS).
-- The full forward + decode + NMS + result D2H (into pinned memory) is captured as **one CUDA graph**; per frame the host does one graph launch and one sync.
-
-**Accumulation modes** — GA10x runs fp32-accumulate HMMA at half the fp16-accumulate rate, and ncu shows the tensor pipe is the top stall (`math_pipe_throttle` 33%). The default is therefore a *hybrid*: fp16 mma over a bounded K=64 window (2 k-steps), flushed into fp32 registers. This captures most of the pure-fp16 speed while the error stays bounded by the window. `ACC16`/`ACC32` select the pure modes.
-
-**Startup autotuning** — for every conv on the 64×64 tile, the engine times the 4-warp and 8-warp grid variants at load (tens of ms, `NOTUNE=1` to skip) and keeps the winner. The 8-warp variant doubles occupancy (33% → 67%) and hides barrier/wait stalls, but loses on some shapes — measuring beats heuristics, and the choice adapts automatically to other GPUs and model scales.
-
-**Verification** (`make test`) — two levels: (1) at export, the decomposed graph is re-executed with PyTorch fp32 and checked against ultralytics layer hooks (~1e-5); (2) the CUDA engine dumps every op's output and `test/compare.py` checks each against fp16-weight references. End-to-end, detections are compared against ultralytics on real images.
-
-## Performance engineering notes
-
-Every optimization here was accepted or rejected on ncu/nsys measurements (RTX 3060 Ti):
-
-- Initial ncu SpeedOfLight on the big convs: compute 37% / memory 78–83% — L2-bandwidth bound on im2col A-tile re-reads (one per n-block). Wide-N tiles (64×128, 256 threads) fixed this.
-- Warp-stall profile after that: `math_pipe_throttle` 33%, `barrier` 20%, `wait` 20%, `long_scoreboard` (global memory) **1.7%** — tensor-pipe bound, not memory. This motivated the hybrid accumulation default and the 8-warp autotuned grids.
-- Tried and rejected, with numbers:
-  - **Two-pass explicit im2col** for stride-2 convs — the dense A matrix (29 MB) exceeds L2 (4 MB), turning L2-resident re-reads into DRAM round-trips (m: 4.08 → 4.31 ms).
-  - **(64,256) tiles with 2 stages** — shallow pipeline made 1×1 convs 2.3× slower.
-  - **`cp.async.ca`** (L1-cached loads) — shared memory occupies the L1 partition; no effect.
-  - **Space-to-depth for stride-2 convs** — mooted by the stall data above (memory stall is 1.7%).
-  - **mbarrier `cuda::pipeline`** (arrive/wait split instead of `__syncthreads`) — per-stage mbarrier overhead exceeded the barrier savings (n 0.99 → 1.11 ms, m 4.10 → 4.75 ms).
-
-**Not implemented: TMA + `wgmma`.** These are Hopper-class (SM 9.0+) features — hardware async tensor-memory copies and warpgroup-level async MMA would replace this engine's `cp.async` loaders and per-k-step barrier synchronization outright, and are the expected next structural win. This repo targets SM 8.6 and has only been tuned and verified on Ampere; a Hopper port is untested future work.
+**Not implemented: TMA + `wgmma`.** Those are Hopper-class (SM 9.0+) features; they would replace the `cp.async` loaders and the per-k-step barrier outright and are the obvious next structural win. This repo is tuned and verified **on SM 8.6 (Ampere) only** — a Hopper port is untested future work.
 
 ## Layout
 
 ```
-engine/engine.cu          the entire engine: graph executor, kernels, CLI
+engine/engine.cu          the entire engine: graph executor, kernels, CLI  (~1,200 lines)
 export/export_yolo11.py   graph/weight exporter + reference generator
 test/compare.py           per-op numeric comparison
 third_party/stb_image.h   vendored jpg/png loader
@@ -99,6 +114,10 @@ build/<model>/            export artifacts (not tracked)
 
 ## Requirements
 
-- NVIDIA GPU, SM 8.0+ (uses `cp.async`, `ldmatrix`, `mma.sync`; tuned on SM 8.6 — pass `ARCH=-arch=sm_XX` to make for other targets)
+- NVIDIA GPU, SM 8.0+ (`cp.async`, `ldmatrix`, `mma.sync`; tuned on SM 8.6 — `make ARCH=-arch=sm_XX` for other targets)
 - CUDA toolkit 12+
 - Python + `ultralytics` for the export step only
+
+## License
+
+MIT © 2026 Soju06
