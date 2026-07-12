@@ -15,6 +15,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
+#include <cstring>
 #include <deque>
 #include <future>
 #include <mutex>
@@ -260,9 +261,31 @@ int main(int argc, char** argv) {
     else if (a == "--target-ms" && i + 1 < argc) targetMs = atof(argv[++i]);
     else { printf("usage: yolo11serve [--dir build/yolo11n] [--addr 0.0.0.0:50051] [--max-batch 16] [--target-ms 50]\n"); return 1; }
   }
+  // cheap graph-header peek: refuse non-detect dirs BEFORE the expensive engine init
+  // (autotune + CUDA graph capture at max-batch). proto Box is axis-aligned and classify
+  // has no box output; rotated-box RPC is follow-up work. v1 headers (no TASK line) are
+  // detect by construction.
+  {
+    char task[16] = "detect";
+    FILE* f = fopen((dir + "/model.graph").c_str(), "r");
+    if (f) {
+      char magic[32]; int ver = 0;
+      if (fscanf(f, "%31s %d", magic, &ver) == 2 && ver >= 2 &&
+          fscanf(f, "%*s %15s", task) != 1) snprintf(task, sizeof task, "unknown");
+      fclose(f);
+    }
+    if (strcmp(task, "detect") != 0) {
+      fprintf(stderr, "server supports detect models only (got '%s' model dir)\n", task);
+      return 1;
+    }
+  }
   Server s;
   s.maxB = maxB; s.targetMs = targetMs;
   s.eng = yolo_create(dir.c_str(), maxB);
+  if (yolo_task(s.eng) != 0) {   // backstop for dirs the peek could not read
+    fprintf(stderr, "server supports detect models only\n");
+    return 1;
+  }
   if (nvjpegCreateSimple(&s.nvj) != NVJPEG_STATUS_SUCCESS) {
     fprintf(stderr, "nvjpeg init failed\n"); return 1;
   }

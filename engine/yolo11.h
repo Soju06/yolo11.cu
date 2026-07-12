@@ -5,9 +5,15 @@
 extern "C" {
 
 typedef struct { float x1, y1, x2, y2, score; int cls; } YoloDet;
+typedef struct { float x, y, w, h, angle, score; int cls; } YoloObbDet;
 
 // Load model dir, fuse, autotune, build+calibrate CUDA graphs for B = 1..max_batch.
 void* yolo_create(const char* model_dir, int max_batch);
+// Task of the loaded model: 0 = detect, 1 = obb, 2 = classify. Check this before fetching:
+// yolo_get is valid only on detect handles and yolo_get_obb only on obb handles — the wrong
+// getter reads the result buffer at the wrong record stride and returns garbage; classify
+// results are not exposed through this API at all.
+int yolo_task(void* h);
 // Calibrated GPU latency (ms) of a full batch-B forward (net + decode + NMS + D2H).
 float yolo_exec_ms(void* h, int B);
 cudaStream_t yolo_stream(void* h);
@@ -22,5 +28,8 @@ void yolo_run_async(void* h, int B);
 void yolo_sync(void* h);
 // Fetch detections for a slot, mapped back to original image coordinates. Returns count.
 int yolo_get(void* h, int slot, YoloDet* out, int cap);
+// OBB variant: rotated boxes (center xy, wh, angle in radians), original image coords
+// (angle unchanged, no clipping — matches ultralytics scale_boxes(xywh=True)).
+int yolo_get_obb(void* h, int slot, YoloObbDet* out, int cap);
 
 }  // extern "C"
