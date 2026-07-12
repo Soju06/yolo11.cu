@@ -1,0 +1,7 @@
+build/
+yolo11cuda
+engine_bin
+*.pt
+__pycache__/
+*.nsys-rep
+*.sqlite
