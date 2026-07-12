@@ -36,6 +36,9 @@ struct Op {
 
 struct Net {
   int B = 1;                   // max batch size (buffers sized for this)
+  int inH = 0, inW = 0;        // input size (graph tensor 0; v2 header cross-checks it)
+  int nc = 80;                 // class count (v2 header; v1 default)
+  char task[16] = "detect";    // v2 header; v1 default
   std::vector<Buf> bufs;
   std::vector<Ten> tens;
   std::vector<Op> ops;
@@ -47,6 +50,7 @@ struct Net {
   int*    outcnt = nullptr;
   float*  h_out = nullptr;     // pinned host mirrors (copied inside the graph)
   int*    h_cnt = nullptr;
+  int*    h_rawcnt = nullptr;  // pre-NMS candidate count (NMS_CAP truncation tripwire)
   __half* attnP = nullptr;     // attention probs [heads][N][N]
   __half* vt = nullptr;        // V transposed [heads][hd][N]
   float*  zerobias = nullptr;  // zero bias for GEMM-as-conv calls
@@ -65,11 +69,18 @@ static void loadGraph(Net& net, const std::string& dir) {
   FILE* f = fopen((dir + "/model.graph").c_str(), "r");
   if (!f) { fprintf(stderr, "no model.graph\n"); exit(1); }
   char magic[64]; int ver;
+  char tag[32];
   if (fscanf(f, "%63s %d", magic, &ver) != 2) exit(1);
+  if (ver >= 2) {  // v2: 'TASK <task> <nc> <imgsz>' line; v1 defaults detect/80/640
+    int hsz;
+    if (fscanf(f, "%31s %15s %d %d", tag, net.task, &net.nc, &hsz) != 4 || strcmp(tag, "TASK")) {
+      fprintf(stderr, "bad TASK header\n"); exit(1);
+    }
+    net.inH = net.inW = hsz;
+  }
   int nb, nt, no;
   if (fscanf(f, "%d %d %d", &nb, &nt, &no) != 3) exit(1);
   net.bufs.resize(nb); net.tens.resize(nt);
-  char tag[32];
   for (int i = 0; i < nb; i++) { Buf& b = net.bufs[i]; if (fscanf(f, "%31s %d %d %d", tag, &b.H, &b.W, &b.C) != 4) exit(1); }
   for (int i = 0; i < nt; i++) { Ten& t = net.tens[i]; if (fscanf(f, "%31s %d %d %d", tag, &t.buf, &t.coff, &t.C) != 4) exit(1); }
   for (int i = 0; i < no; i++) {
@@ -94,6 +105,19 @@ static void loadGraph(Net& net, const std::string& dir) {
     net.ops.push_back(op);
   }
   fclose(f);
+
+  // input dims: tensor 0's buffer is the source of truth; the header is a consistency check
+  const Buf& ib0 = net.bufs[net.tens[0].buf];
+  if (net.inH && (net.inH != ib0.H || net.inW != ib0.W)) { fprintf(stderr, "imgsz header mismatch\n"); exit(1); }
+  net.inH = ib0.H; net.inW = ib0.W;
+
+  // fail fast on the class-count invariants k_decode relies on (vec8 cls loads, cls view
+  // width == nc); the obb/cls specs own lifting nc % 8
+  for (const Op& op : net.ops)
+    if (op.kind == DECODE && (net.nc % 8 || net.tens[op.b].C != net.nc)) {
+      fprintf(stderr, "DECODE needs nc %% 8 == 0 and cls view C == nc (nc=%d, C=%d)\n",
+              net.nc, net.tens[op.b].C); exit(1);
+    }
 
   for (auto& b : net.bufs) CK(cudaMalloc(&b.p, (size_t)net.B * b.H * b.W * b.C * sizeof(__half)));
   for (auto& b : net.bufs) CK(cudaMemset(b.p, 0, (size_t)net.B * b.H * b.W * b.C * sizeof(__half)));
@@ -120,6 +144,8 @@ static void loadGraph(Net& net, const std::string& dir) {
   CK(cudaMalloc(&net.outcnt, net.B * sizeof(int)));
   CK(cudaMallocHost(&net.h_out, (size_t)net.B * 300 * 6 * sizeof(float)));
   CK(cudaMallocHost(&net.h_cnt, net.B * sizeof(int)));
+  CK(cudaMallocHost(&net.h_rawcnt, net.B * sizeof(int)));
+  memset(net.h_rawcnt, 0, net.B * sizeof(int));
   // attention scratch sized from the graph (heads varies by model scale)
   int maxheads = 0, maxN = 0, maxhd = 64;
   for (const Op& op : net.ops)
@@ -133,8 +159,14 @@ static void loadGraph(Net& net, const std::string& dir) {
     CK(cudaMalloc(&net.attnP, (size_t)maxheads * maxN * maxN * sizeof(__half)));
     CK(cudaMalloc(&net.vt, (size_t)maxheads * maxhd * maxN * sizeof(__half)));
   }
-  CK(cudaMalloc(&net.zerobias, 1024 * sizeof(float)));
-  CK(cudaMemset(net.zerobias, 0, 1024 * sizeof(float)));
+  // attention scores GEMM has Cout = N: the zero bias must cover N (+1 for the half2 epilogue)
+  int zbN = std::max(1024, ((maxN + 7) & ~7) + 8);
+  CK(cudaMalloc(&net.zerobias, zbN * sizeof(float)));
+  CK(cudaMemset(net.zerobias, 0, zbN * sizeof(float)));
+  size_t act = 0;
+  for (const Buf& b : net.bufs) act += (size_t)net.B * b.H * b.W * b.C * sizeof(__half);
+  printf("graph v%d: task=%s nc=%d input=%dx%d, activations %.1f MB (B=%d)\n",
+         ver, net.task, net.nc, net.inH, net.inW, act / 1e6, net.B);
 }
 
 // ------------------------- kernels: phase B (tensor core implicit GEMM) -------------------------
@@ -603,12 +635,14 @@ __global__ void k_copyc(const __half* X, int xs, int xo, __half* Y, int ys, int 
 }
 
 // attention: qkv buffer [N tokens, heads*(2kd+hd)] strided; out [N, heads*hd].
-// one block per (token, head); scores in smem.
+// one block per (token, head, image); scores in smem. Correct for any N (mma fallback).
 __global__ void k_attn(const __half* __restrict__ QKV, int qs, int qo,
                        __half* __restrict__ Y, int ys, int yo,
                        int N, int heads, int kd, int hd) {
   int n = blockIdx.x, h = blockIdx.y;
   int per = 2 * kd + hd;
+  QKV += (size_t)blockIdx.z * N * qs;   // image offset (tokens must not mix across images)
+  Y += (size_t)blockIdx.z * N * ys;
   extern __shared__ float sm[];        // scores[N] + red[32]
   float* scores = sm;
   const __half* q = QKV + (size_t)n * qs + qo + h * per;
@@ -709,7 +743,7 @@ __global__ void k_decode(const __half* __restrict__ BOX, int bs, int bo,
   o[4] = score; o[5] = (float)bcls;
 }
 
-// letterbox preprocess: BGR u8 HWC (sh x sw) -> RGB fp16 NHWC 640x640, /255, pad 114.
+// letterbox preprocess: BGR u8 HWC (sh x sw) -> RGB fp16 NHWC (dh x dw), /255, pad 114.
 // bilinear resize matching cv2.INTER_LINEAR.
 __global__ void k_preprocess(const uint8_t* __restrict__ src, int sh, int sw,
                              __half* __restrict__ dst, int dh, int dw,
@@ -922,10 +956,13 @@ static void runOp(Net& net, const Op& op, cudaStream_t st, int Bn) {
     case ATTN: {
       View q = view(net, op.a), y = view(net, op.out);
       int N = q.H * q.W;
-      if (op.kd == 32 && op.hd == 64 && N == 400) {
+      // mma path alignment: cp.async vec8 tiles need kd % 8 and N % 8 (P@V^T reads attnP
+      // rows of length N), half2 stores need hd % 2. q.s % 8 holds by construction.
+      bool mma_ok = (op.kd % 8 == 0) && (op.hd % 2 == 0) && (N % 8 == 0);
+      if (mma_ok) {
         // tensor-core attention via the implicit-GEMM kernel:
-        //   scores[h] = Q[400x32] @ K^T   (K rows read in place from the qkv buffer)
-        //   P = softmax(scores * 1/sqrt(kd));  out[h] = P[400x400] @ V[400x64] via V^T
+        //   scores[h] = Q[Nxkd] @ K^T   (K rows read in place from the qkv buffer)
+        //   P = softmax(scores * 1/sqrt(kd));  out[h] = P[NxN] @ V[Nxhd] via V^T
         const int per = 2 * op.kd + op.hd;
         for (int img = 0; img < Bn; img++) {   // per-image attention (tokens must not mix)
           const __half* qb = q.p + (size_t)img * N * q.s;
@@ -952,8 +989,8 @@ static void runOp(Net& net, const Op& op, cudaStream_t st, int Bn) {
           }
         }
       } else {
-        if (Bn != 1) { fprintf(stderr, "fallback attention supports batch=1 only\n"); exit(1); }
-        dim3 grid(N, op.heads);
+        // slow but shape-generic; gridDim.z carries the batch (one image per z-slice)
+        dim3 grid(N, op.heads, Bn);
         size_t smem = N * sizeof(float);
         k_attn<<<grid, 128, smem, st>>>(q.p, q.s, q.o, (__half*)y.p, y.s, y.o, N, op.heads, op.kd, op.hd);
       }
@@ -963,7 +1000,7 @@ static void runOp(Net& net, const Op& op, cudaStream_t st, int Bn) {
       View b = view(net, op.a), c = view(net, op.b);
       int total = Bn * b.H * b.W;
       k_decode<<<(total + TB - 1) / TB, TB, 0, st>>>(b.p, b.s, b.o, c.p, c.s, c.o,
-          b.H, b.W, op.stride, 0.25f, net.dets, net.detcnt, Net::MAXDET, 80, Bn);
+          b.H, b.W, op.stride, 0.25f, net.dets, net.detcnt, Net::MAXDET, net.nc, Bn);
       break;
     }
   }
@@ -973,6 +1010,7 @@ static void forward(Net& net, cudaStream_t st, int Bn) {
   CK(cudaMemsetAsync(net.detcnt, 0, Bn * sizeof(int), st));
   for (auto& op : net.ops) runOp(net, op, st, Bn);
   k_nms<<<Bn, 256, 0, st>>>(net.dets, net.detcnt, net.outdets, net.outcnt, 0.45f, Net::MAXDET);
+  CK(cudaMemcpyAsync(net.h_rawcnt, net.detcnt, Bn * sizeof(int), cudaMemcpyDeviceToHost, st));
   CK(cudaMemcpyAsync(net.h_cnt, net.outcnt, Bn * sizeof(int), cudaMemcpyDeviceToHost, st));
   CK(cudaMemcpyAsync(net.h_out, net.outdets, (size_t)Bn * 300 * 6 * sizeof(float), cudaMemcpyDeviceToHost, st));
 }
@@ -1028,9 +1066,19 @@ static void autotune(Net& net, cudaStream_t st) {
 
 // ------------------------- CPU NMS -------------------------
 struct Det { float x1, y1, x2, y2, sc; int cls; };
+// k_nms only sorts the first NMS_CAP candidates (smem-bound); make truncation observable
+static void nmsTripwire(const Net& net, int img) {
+  static bool warned = false;
+  if (!warned && net.h_rawcnt[img] > NMS_CAP) {
+    fprintf(stderr, "warning: img %d had %d conf-passing candidates, NMS saw only %d\n",
+            img, net.h_rawcnt[img], NMS_CAP);
+    warned = true;
+  }
+}
 // NMS ran on the GPU inside the graph; just fetch the compacted results.
 static std::vector<Det> fetchNMS(Net& net, int img = 0) {
   // results were copied into pinned host memory inside the graph; stream is already synced
+  nmsTripwire(net, img);
   int cnt = net.h_cnt[img];
   std::vector<Det> v;
   for (int i = 0; i < cnt; i++) {
@@ -1113,12 +1161,12 @@ extern "C" cudaStream_t yolo_stream(void* p) { return ((YoloHandle*)p)->st; }
 extern "C" void yolo_preprocess(void* p, const unsigned char* dev_bgr, int sh, int sw, int slot) {
   auto* h = (YoloHandle*)p;
   Buf& ib = h->net.bufs[h->net.tens[0].buf];
-  float scale = std::min(640.f / sh, 640.f / sw);
+  float scale = std::min((float)ib.H / sh, (float)ib.W / sw);
   int nh = (int)roundf(sh * scale), nw = (int)roundf(sw * scale);
-  int top = (640 - nh) / 2, left = (640 - nw) / 2;
+  int top = (ib.H - nh) / 2, left = (ib.W - nw) / 2;
   h->slots[slot] = {scale, top, left};
-  k_preprocess<<<(640 * 640 + 255) / 256, 256, 0, h->st>>>(
-      dev_bgr, sh, sw, ib.p + (size_t)slot * 640 * 640 * 3, 640, 640, scale, top, left, nh, nw);
+  k_preprocess<<<(ib.H * ib.W + 255) / 256, 256, 0, h->st>>>(
+      dev_bgr, sh, sw, ib.p + (size_t)slot * ib.H * ib.W * ib.C, ib.H, ib.W, scale, top, left, nh, nw);
 }
 
 extern "C" void yolo_run(void* p, int B) {
@@ -1137,6 +1185,7 @@ extern "C" void yolo_sync(void* p) { CK(cudaStreamSynchronize(((YoloHandle*)p)->
 extern "C" int yolo_get(void* p, int slot, YoloDet* out, int cap) {
   auto* h = (YoloHandle*)p;
   const auto& sm = h->slots[slot];
+  nmsTripwire(h->net, slot);
   int cnt = std::min(h->net.h_cnt[slot], cap);
   for (int i = 0; i < cnt; i++) {
     const float* d = h->net.h_out + ((size_t)slot * 300 + i) * 6;
@@ -1219,11 +1268,11 @@ int main(int argc, char** argv) {
       uint8_t* dimg; CK(cudaMalloc(&dimg, (size_t)sh * sw * 3));
       CK(cudaMemcpy(dimg, img, (size_t)sh * sw * 3, cudaMemcpyHostToDevice));
       stbi_image_free(img);
-      scale = std::min(640.f / sh, 640.f / sw);
+      scale = std::min((float)ib.H / sh, (float)ib.W / sw);
       int nh = (int)roundf(sh * scale), nw = (int)roundf(sw * scale);
-      top = (640 - nh) / 2; left = (640 - nw) / 2;
-      k_preprocess<<<(640 * 640 + 255) / 256, 256, 0, st>>>(
-          dimg, sh, sw, ib.p, 640, 640, scale, top, left, nh, nw);
+      top = (ib.H - nh) / 2; left = (ib.W - nw) / 2;
+      k_preprocess<<<(ib.H * ib.W + 255) / 256, 256, 0, st>>>(
+          dimg, sh, sw, ib.p, ib.H, ib.W, scale, top, left, nh, nw);
     }
     forward(net, st, net.B);
     CK(cudaStreamSynchronize(st));
@@ -1251,16 +1300,16 @@ int main(int argc, char** argv) {
     CK(cudaMallocHost(&himg, raw.size()));
     memcpy(himg, raw.data(), raw.size());
     CK(cudaMalloc(&dimg, raw.size()));
-    float scale = std::min(640.f / sh, 640.f / sw);
-    int nh = (int)roundf(sh * scale), nw = (int)roundf(sw * scale);
-    int top = (640 - nh) / 2, left = (640 - nw) / 2;
     Buf& inb = net.bufs[net.tens[0].buf];
+    float scale = std::min((float)inb.H / sh, (float)inb.W / sw);
+    int nh = (int)roundf(sh * scale), nw = (int)roundf(sw * scale);
+    int top = (inb.H - nh) / 2, left = (inb.W - nw) / 2;
 
     cudaGraph_t graph; cudaGraphExec_t gexec;
     CK(cudaStreamBeginCapture(st, cudaStreamCaptureModeGlobal));
     CK(cudaMemcpyAsync(dimg, himg, raw.size(), cudaMemcpyHostToDevice, st));
-    k_preprocess<<<(640 * 640 + 255) / 256, 256, 0, st>>>(
-        dimg, sh, sw, inb.p, 640, 640, scale, top, left, nh, nw);
+    k_preprocess<<<(inb.H * inb.W + 255) / 256, 256, 0, st>>>(
+        dimg, sh, sw, inb.p, inb.H, inb.W, scale, top, left, nh, nw);
     forward(net, st, net.B);
     CK(cudaStreamEndCapture(st, &graph));
     CK(cudaGraphInstantiate(&gexec, graph, 0));

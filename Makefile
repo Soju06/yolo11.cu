@@ -11,7 +11,7 @@ $(BIN): engine/engine.cu third_party/stb_image.h
 
 # download weights, export graph + reference dumps for $(MODEL)  (yolo11n / yolo11s / yolo11m ...)
 export:
-	python3 export/export_yolo11.py $(MODEL)
+	python3 export/export_yolo11.py $(MODEL) $(if $(IMGSZ),--imgsz $(IMGSZ))
 
 # per-op numeric verification + end-to-end detection check
 test: $(BIN)
