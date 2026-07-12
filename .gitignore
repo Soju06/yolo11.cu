@@ -5,3 +5,8 @@ engine_bin
 __pycache__/
 *.nsys-rep
 *.sqlite
+server/yolo.pb.*
+server/yolo.grpc.pb.*
+engine_lib.o
+yolo11serve
+nohup.out

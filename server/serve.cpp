@@ -1,0 +1,286 @@
+// yolo11serve — gRPC batch-labeling server on top of the yolo11.cu engine.
+//
+// Scheduling: deadline-aware dynamic batching. Every request gets a deadline
+// (arrival + target latency). The batcher keeps admitting requests into the
+// pending batch for as long as the OLDEST request could still meet its
+// deadline if we waited and then ran a full max-batch — using the engine's
+// calibrated per-batch-size latency model plus a decode-time EMA. The moment
+// waiting longer would risk the oldest deadline (or the batch is full), it
+// fires with everything queued. This maximizes batch size — and therefore
+// throughput — subject to the latency SLO.
+#include <grpcpp/grpcpp.h>
+#include <nvjpeg.h>
+#include <cuda_runtime.h>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <cstdio>
+#include <deque>
+#include <future>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <vector>
+#include "yolo.pb.h"
+#include "yolo.grpc.pb.h"
+#include "../engine/yolo11.h"
+#include "../third_party/stb_image.h"   // implementation lives in the engine object
+
+#define CK(x) do { cudaError_t e = (x); if (e != cudaSuccess) { \
+  fprintf(stderr, "CUDA error %s at %s:%d\n", cudaGetErrorString(e), __FILE__, __LINE__); exit(1);} } while (0)
+
+using Clock = std::chrono::steady_clock;
+static double ms_since(Clock::time_point a, Clock::time_point b) {
+  return std::chrono::duration<double, std::milli>(b - a).count();
+}
+
+struct Req {
+  const std::string* data;
+  Clock::time_point arrival, deadline;
+  yolo::DetectResponse* resp;
+  std::promise<bool> done;   // false = decode failure
+};
+
+struct Server {
+  void* eng;
+  int maxB;
+  double targetMs, safetyMs = 1.0;
+  std::deque<Req*> q;
+  std::mutex mu;
+  std::condition_variable cv;
+  std::atomic<long> served{0};
+  double decodeEmaMs = 2.0;   // per-image decode estimate, updated online
+
+  // nvJPEG + per-slot device scratch
+  nvjpegHandle_t nvj;
+  std::vector<unsigned char*> scratch;
+  std::vector<size_t> scratchSz;
+
+  // decoder pool: per-thread nvJPEG state + CUDA stream; parallel CPU huffman across cores.
+  struct DecodeJob {
+    std::vector<Req*>* batch;
+    std::vector<int>*ok; std::vector<int>* hh; std::vector<int>* ww;
+    std::atomic<int> next{0}, done{0};
+    int B = 0;
+  };
+  DecodeJob* job = nullptr;
+  std::mutex dmu; std::condition_variable dcv, dcvDone;
+  int nDecoders = 8;
+
+  int slotBase = 0;   // current scratch set (0 or maxB)
+
+  void decodeOne(nvjpegJpegState_t state, cudaStream_t st, int i) {
+    int slot = slotBase + i;
+    auto& bytes = *(*job->batch)[i]->data;
+    const auto* p = (const unsigned char*)bytes.data();
+    int& w = (*job->ww)[i]; int& h = (*job->hh)[i];
+    (*job->ok)[i] = 0;
+    if (bytes.size() > 3 && p[0] == 0xFF && p[1] == 0xD8) {   // jpeg -> GPU decode
+      int nc; nvjpegChromaSubsampling_t ss; int ws[NVJPEG_MAX_COMPONENT], hs[NVJPEG_MAX_COMPONENT];
+      if (nvjpegGetImageInfo(nvj, p, bytes.size(), &nc, &ss, ws, hs) != NVJPEG_STATUS_SUCCESS) return;
+      w = ws[0]; h = hs[0];
+      ensure(slot, (size_t)w * h * 3);
+      nvjpegImage_t out{};
+      out.channel[0] = scratch[slot];
+      out.pitch[0] = w * 3;
+      if (nvjpegDecode(nvj, state, p, bytes.size(), NVJPEG_OUTPUT_BGRI, &out, st) != NVJPEG_STATUS_SUCCESS)
+        return;
+      CK(cudaStreamSynchronize(st));
+      (*job->ok)[i] = 1;
+    } else {                                                  // png etc -> stb on CPU
+      int comp;
+      unsigned char* img = stbi_load_from_memory(p, (int)bytes.size(), &w, &h, &comp, 3);
+      if (!img) return;
+      for (size_t k = 0; k < (size_t)w * h; k++) std::swap(img[k * 3], img[k * 3 + 2]);
+      ensure(slot, (size_t)w * h * 3);
+      CK(cudaMemcpyAsync(scratch[slot], img, (size_t)w * h * 3, cudaMemcpyHostToDevice, st));
+      CK(cudaStreamSynchronize(st));
+      stbi_image_free(img);
+      (*job->ok)[i] = 1;
+    }
+  }
+
+  void decoderThread() {
+    nvjpegJpegState_t state; nvjpegJpegStateCreate(nvj, &state);
+    cudaStream_t st; CK(cudaStreamCreate(&st));
+    for (;;) {
+      DecodeJob* j;
+      {
+        std::unique_lock<std::mutex> lk(dmu);
+        dcv.wait(lk, [&] { return job && job->next.load() < job->B; });
+        j = job;
+      }
+      int i;
+      while ((i = j->next.fetch_add(1)) < j->B) {
+        decodeOne(state, st, i);
+        if (j->done.fetch_add(1) + 1 == j->B) { std::lock_guard<std::mutex> lk(dmu); dcvDone.notify_all(); }
+      }
+    }
+  }
+
+  void decodeBatch(std::vector<Req*>& batch, std::vector<int>& ok,
+                   std::vector<int>& hh, std::vector<int>& ww) {
+    DecodeJob j;
+    j.batch = &batch; j.ok = &ok; j.hh = &hh; j.ww = &ww; j.B = (int)batch.size();
+    {
+      std::lock_guard<std::mutex> lk(dmu);
+      job = &j;
+    }
+    dcv.notify_all();
+    {
+      std::unique_lock<std::mutex> lk(dmu);
+      dcvDone.wait(lk, [&] { return j.done.load() == j.B; });
+      job = nullptr;
+    }
+  }
+  void ensure(int slot, size_t n) {
+    if (scratchSz[slot] >= n) return;
+    if (scratch[slot]) CK(cudaFree(scratch[slot]));
+    CK(cudaMalloc(&scratch[slot], n));
+    scratchSz[slot] = n;
+  }
+
+  // ---- the batcher + 2-stage pipeline: decode batch k+1 concurrently with GPU batch k ----
+  struct Inflight {
+    std::vector<Req*> batch;
+    std::vector<int> ok, hh, ww;
+    Clock::time_point tLaunch;
+    int B = 0;
+  };
+
+  void collect(std::vector<Req*>& batch) {
+    std::unique_lock<std::mutex> lk(mu);
+    cv.wait(lk, [&] { return !q.empty(); });
+    for (;;) {
+      if ((int)q.size() >= maxB) break;
+      // cost if we fired right now vs headroom the oldest request has left
+      double slackMs = targetMs - ms_since(q.front()->arrival, Clock::now())
+                       - yolo_exec_ms(eng, maxB) - decodeEmaMs - safetyMs;
+      if (slackMs <= 0) break;                       // waiting longer risks the SLO — fire
+      cv.wait_for(lk, std::chrono::microseconds(std::min((long)(slackMs * 1000), 200L)));
+    }
+    int B = std::min((int)q.size(), maxB);
+    batch.assign(q.begin(), q.begin() + B);
+    q.erase(q.begin(), q.begin() + B);
+  }
+
+  void respond(Inflight& f, double inferMs) {
+    YoloDet dets[300];
+    for (int i = 0; i < f.B; i++) {
+      Req* r = f.batch[i];
+      if (f.ok[i]) {
+        int n = yolo_get(eng, i, dets, 300);
+        for (int j = 0; j < n; j++) {
+          auto* b = r->resp->add_boxes();
+          b->set_x1(dets[j].x1); b->set_y1(dets[j].y1);
+          b->set_x2(dets[j].x2); b->set_y2(dets[j].y2);
+          b->set_score(dets[j].score); b->set_cls(dets[j].cls);
+        }
+      }
+      r->resp->set_queue_ms((float)ms_since(r->arrival, f.tLaunch));
+      r->resp->set_infer_ms((float)inferMs);
+      r->resp->set_batch(f.B);
+      r->done.set_value(f.ok[i]);
+    }
+    long n = served += f.B;
+    if (n % 5000 < f.B)
+      printf("[serve] %ld imgs, B=%d gpu %.2f ms (%.0f img/s in-batch)\n",
+             n, f.B, inferMs, f.B * 1000.0 / inferMs);
+  }
+
+  void worker() {
+    Inflight cur, prev;
+    bool havePrev = false;
+    for (;;) {
+      collect(cur.batch);
+      cur.B = (int)cur.batch.size();
+      cur.ok.assign(cur.B, 0); cur.hh.assign(cur.B, 0); cur.ww.assign(cur.B, 0);
+      auto d0 = Clock::now();
+      decodeBatch(cur.batch, cur.ok, cur.hh, cur.ww);     // decoder pool || GPU running prev
+      decodeEmaMs = 0.9 * decodeEmaMs + 0.1 * ms_since(d0, Clock::now());
+      if (havePrev) {                                     // prev finished while we decoded
+        yolo_sync(eng);
+        respond(prev, ms_since(prev.tLaunch, Clock::now()));
+      }
+      for (int i = 0; i < cur.B; i++)                     // engine stream: serializes after prev graph
+        if (cur.ok[i]) yolo_preprocess(eng, scratch[slotBase + i], cur.hh[i], cur.ww[i], i);
+      cur.tLaunch = Clock::now();
+      yolo_run_async(eng, cur.B);
+      prev = std::move(cur);
+      havePrev = true;
+      slotBase = maxB - slotBase;                         // ping-pong scratch set
+      // opportunistic drain: if the queue is empty, finish prev now instead of waiting for traffic
+      {
+        std::unique_lock<std::mutex> lk(mu);
+        if (q.empty()) {
+          lk.unlock();
+          yolo_sync(eng);
+          respond(prev, ms_since(prev.tLaunch, Clock::now()));
+          havePrev = false;
+        }
+      }
+    }
+  }
+};
+
+class YoloService final : public yolo::Yolo::Service {
+ public:
+  explicit YoloService(Server* s) : s_(s) {}
+  grpc::Status Detect(grpc::ServerContext*, const yolo::DetectRequest* req,
+                      yolo::DetectResponse* resp) override {
+    Req r;
+    r.data = &req->image();
+    r.arrival = Clock::now();
+    r.deadline = r.arrival + std::chrono::microseconds((long)(s_->targetMs * 1000));
+    r.resp = resp;
+    auto fut = r.done.get_future();
+    {
+      std::lock_guard<std::mutex> lk(s_->mu);
+      s_->q.push_back(&r);
+    }
+    s_->cv.notify_all();
+    bool ok = fut.get();
+    return ok ? grpc::Status::OK
+              : grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "image decode failed");
+  }
+ private:
+  Server* s_;
+};
+
+int main(int argc, char** argv) {
+  setvbuf(stdout, nullptr, _IOLBF, 0);
+  std::string dir = "build/yolo11n", addr = "0.0.0.0:50051";
+  int maxB = 16;
+  double targetMs = 50.0;
+  for (int i = 1; i < argc; i++) {
+    std::string a = argv[i];
+    if (a == "--dir" && i + 1 < argc) dir = argv[++i];
+    else if (a == "--addr" && i + 1 < argc) addr = argv[++i];
+    else if (a == "--max-batch" && i + 1 < argc) maxB = atoi(argv[++i]);
+    else if (a == "--target-ms" && i + 1 < argc) targetMs = atof(argv[++i]);
+    else { printf("usage: yolo11serve [--dir build/yolo11n] [--addr 0.0.0.0:50051] [--max-batch 16] [--target-ms 50]\n"); return 1; }
+  }
+  Server s;
+  s.maxB = maxB; s.targetMs = targetMs;
+  s.eng = yolo_create(dir.c_str(), maxB);
+  if (nvjpegCreateSimple(&s.nvj) != NVJPEG_STATUS_SUCCESS) {
+    fprintf(stderr, "nvjpeg init failed\n"); return 1;
+  }
+  s.scratch.assign(2 * maxB, nullptr);   // ping-pong slot sets for the decode/infer pipeline
+  s.scratchSz.assign(2 * maxB, 0);
+  s.nDecoders = std::min(8u, std::max(2u, std::thread::hardware_concurrency() - 2));
+  for (int i = 0; i < s.nDecoders; i++) std::thread([&] { s.decoderThread(); }).detach();
+  std::thread worker([&] { s.worker(); });
+
+  YoloService svc(&s);
+  grpc::ServerBuilder b;
+  b.AddListeningPort(addr, grpc::InsecureServerCredentials());
+  b.SetMaxReceiveMessageSize(64 << 20);
+  b.RegisterService(&svc);
+  auto server = b.BuildAndStart();
+  printf("yolo11serve listening on %s (model=%s, max-batch=%d, target=%.0f ms)\n",
+         addr.c_str(), dir.c_str(), maxB, targetMs);
+  server->Wait();
+  worker.join();
+  return 0;
+}

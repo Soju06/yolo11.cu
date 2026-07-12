@@ -1063,6 +1063,90 @@ static void usage() {
          "     ACC32=1 -> pure fp32 accumulation (exact-est). default: hybrid K=64 window\n");
 }
 
+// ------------------------- embedding API (see engine/yolo11.h) -------------------------
+#include "yolo11.h"
+
+struct YoloHandle {
+  Net net;
+  cudaStream_t st;
+  std::vector<cudaGraphExec_t> graphs;   // graphs[B-1]
+  std::vector<float> execMs;             // calibrated per-B latency
+  struct SlotMap { float scale; int top, left; };
+  std::vector<SlotMap> slots;
+};
+
+extern "C" void* yolo_create(const char* model_dir, int max_batch) {
+  auto* h = new YoloHandle();
+  h->net.B = max_batch;
+  loadGraph(h->net, model_dir);
+  fuseAdds(h->net);
+  CK(cudaStreamCreate(&h->st));
+  autotune(h->net, h->st);
+  h->graphs.resize(max_batch);
+  h->execMs.resize(max_batch);
+  h->slots.resize(max_batch);
+  cudaEvent_t e0, e1; cudaEventCreate(&e0); cudaEventCreate(&e1);
+  for (int B = 1; B <= max_batch; B++) {
+    cudaGraph_t g;
+    CK(cudaStreamBeginCapture(h->st, cudaStreamCaptureModeGlobal));
+    forward(h->net, h->st, B);
+    CK(cudaStreamEndCapture(h->st, &g));
+    CK(cudaGraphInstantiate(&h->graphs[B - 1], g, 0));
+    CK(cudaGraphDestroy(g));
+    for (int i = 0; i < 3; i++) CK(cudaGraphLaunch(h->graphs[B - 1], h->st));
+    CK(cudaStreamSynchronize(h->st));
+    cudaEventRecord(e0, h->st);
+    for (int i = 0; i < 10; i++) CK(cudaGraphLaunch(h->graphs[B - 1], h->st));
+    cudaEventRecord(e1, h->st);
+    CK(cudaStreamSynchronize(h->st));
+    float ms; cudaEventElapsedTime(&ms, e0, e1);
+    h->execMs[B - 1] = ms / 10.f;
+  }
+  cudaEventDestroy(e0); cudaEventDestroy(e1);
+  printf("engine ready: B=1..%d, exec %.2f..%.2f ms\n", max_batch, h->execMs[0], h->execMs[max_batch - 1]);
+  return h;
+}
+
+extern "C" float yolo_exec_ms(void* p, int B) { return ((YoloHandle*)p)->execMs[B - 1]; }
+extern "C" cudaStream_t yolo_stream(void* p) { return ((YoloHandle*)p)->st; }
+
+extern "C" void yolo_preprocess(void* p, const unsigned char* dev_bgr, int sh, int sw, int slot) {
+  auto* h = (YoloHandle*)p;
+  Buf& ib = h->net.bufs[h->net.tens[0].buf];
+  float scale = std::min(640.f / sh, 640.f / sw);
+  int nh = (int)roundf(sh * scale), nw = (int)roundf(sw * scale);
+  int top = (640 - nh) / 2, left = (640 - nw) / 2;
+  h->slots[slot] = {scale, top, left};
+  k_preprocess<<<(640 * 640 + 255) / 256, 256, 0, h->st>>>(
+      dev_bgr, sh, sw, ib.p + (size_t)slot * 640 * 640 * 3, 640, 640, scale, top, left, nh, nw);
+}
+
+extern "C" void yolo_run(void* p, int B) {
+  auto* h = (YoloHandle*)p;
+  CK(cudaGraphLaunch(h->graphs[B - 1], h->st));
+  CK(cudaStreamSynchronize(h->st));
+}
+
+extern "C" void yolo_run_async(void* p, int B) {
+  auto* h = (YoloHandle*)p;
+  CK(cudaGraphLaunch(h->graphs[B - 1], h->st));
+}
+
+extern "C" void yolo_sync(void* p) { CK(cudaStreamSynchronize(((YoloHandle*)p)->st)); }
+
+extern "C" int yolo_get(void* p, int slot, YoloDet* out, int cap) {
+  auto* h = (YoloHandle*)p;
+  const auto& sm = h->slots[slot];
+  int cnt = std::min(h->net.h_cnt[slot], cap);
+  for (int i = 0; i < cnt; i++) {
+    const float* d = h->net.h_out + ((size_t)slot * 300 + i) * 6;
+    out[i] = {(d[0] - sm.left) / sm.scale, (d[1] - sm.top) / sm.scale,
+              (d[2] - sm.left) / sm.scale, (d[3] - sm.top) / sm.scale, d[4], (int)d[5]};
+  }
+  return cnt;
+}
+
+#ifndef YOLO11_LIB
 // ------------------------- main -------------------------
 int main(int argc, char** argv) {
   std::string mode = argc > 1 ? argv[1] : "detect";
@@ -1263,3 +1347,4 @@ int main(int argc, char** argv) {
   }
   return 0;
 }
+#endif  // YOLO11_LIB

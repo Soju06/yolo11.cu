@@ -1,0 +1,27 @@
+syntax = "proto3";
+package yolo;
+
+service Yolo {
+  // Submit one image (jpeg or png bytes); the server dynamic-batches under its latency target.
+  rpc Detect (DetectRequest) returns (DetectResponse);
+}
+
+message DetectRequest {
+  bytes image = 1;             // jpeg (GPU-decoded via nvJPEG) or png (CPU fallback)
+}
+
+message Box {
+  float x1 = 1;                // original image coordinates
+  float y1 = 2;
+  float x2 = 3;
+  float y2 = 4;
+  float score = 5;
+  int32 cls = 6;               // COCO class id
+}
+
+message DetectResponse {
+  repeated Box boxes = 1;
+  float queue_ms = 2;          // time spent waiting in the batcher
+  float infer_ms = 3;          // GPU batch execution time
+  int32 batch = 4;             // batch size this request rode in
+}
