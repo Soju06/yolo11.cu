@@ -1,4 +1,4 @@
-// yolo11serve — gRPC batch-labeling server on top of the yolo11.cu engine.
+// yoloserve — gRPC batch-labeling server on top of the yolo.cu engine.
 //
 // Scheduling: deadline-aware dynamic batching. Every request gets a deadline
 // (arrival + target latency). The batcher keeps admitting requests into the
@@ -24,7 +24,7 @@
 #include <vector>
 #include "yolo.pb.h"
 #include "yolo.grpc.pb.h"
-#include "../engine/yolo11.h"
+#include "../engine/yolo.h"
 #include "../third_party/stb_image.h"   // implementation lives in the engine object
 
 #define CK(x) do { cudaError_t e = (x); if (e != cudaSuccess) { \
@@ -346,7 +346,7 @@ int main(int argc, char** argv) {
     else if (a == "--max-batch" && i + 1 < argc) maxB = atoi(argv[++i]);
     else if (a == "--target-ms" && i + 1 < argc) targetMs = atof(argv[++i]);
     else {
-      printf("usage: yolo11serve [--dir build/yolo11n[:maxB]]... [--addr 0.0.0.0:50051] "
+      printf("usage: yoloserve [--dir build/yolo11n[:maxB]]... [--addr 0.0.0.0:50051] "
              "[--max-batch 16] [--target-ms 50]\n"
              "multiple --dir flags serve several models from one process; requests route by\n"
              "the DetectRequest.model field (dir basename), default = first --dir\n");
@@ -394,7 +394,7 @@ int main(int argc, char** argv) {
   b.SetMaxReceiveMessageSize(64 << 20);
   b.RegisterService(&svc);
   auto server = b.BuildAndStart();
-  printf("yolo11serve listening on %s (%zu models, target=%.0f ms)\n",
+  printf("yoloserve listening on %s (%zu models, target=%.0f ms)\n",
          addr.c_str(), s.models.size(), targetMs);
   server->Wait();
   worker.join();

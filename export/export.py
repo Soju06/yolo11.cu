@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Export YOLO11n to a primitive-op graph + fp16 weights for the CUDA engine.
+"""Export an ultralytics YOLO (v8/11, any scale/task) to a primitive-op graph + fp16 weights.
 
 Usage: export_yolo11.py <model> [--imgsz S | S]   (default S = model.args imgsz)
 
@@ -31,7 +31,7 @@ while _args:
     a = _args.pop(0)
     if a == '--imgsz':
         if not _args:
-            sys.exit('usage: export_yolo11.py <model> [--imgsz S | S]')
+            sys.exit('usage: export.py <model> [--imgsz S | S]')
         IMGSZ = int(_args.pop(0))
     elif a.isdigit():
         IMGSZ = int(a)
@@ -287,96 +287,128 @@ def c2psa(g, x, mod, out=None):
 
 # ---------------- build the network graph ----------------
 
-def och(mod):
-    """output channels of a top-level layer module"""
-    if isinstance(mod, uconv.Conv):
-        return mod.conv.out_channels
-    if isinstance(mod, (ublock.C3k2, ublock.SPPF, ublock.C2PSA)):
-        return mod.cv2.conv.out_channels
-    raise RuntimeError(type(mod))
+def emit_chain(g, x, mod):
+    """Emit a conv chain, flattening (possibly nested) Sequentials — handles both
+    yolov8's flat head branches and yolo11's DWConv-nested ones."""
+    if isinstance(mod, nn.Sequential):
+        for m_ in mod:
+            x = emit_chain(g, x, m_)
+        return x
+    return g.conv(x, mod)
+
 
 def build(net, g, S):
-    x = g.newt(S, S, 3)  # tensor 0 = input
-    outs = {}
+    """Generic topology walker: follows each module's .f (from) indices, so any
+    ultralytics YOLO composed of the module vocabulary below exports from one code
+    path — yolov8 and yolo11, every scale, every task head. Concats stay zero-copy:
+    the cat buffer is pre-allocated and each producer writes into its slice."""
+    x0 = g.newt(S, S, 3)  # tensor 0 = input
+    n_body = len(net) - 1
 
-    def conv_layer(i, x, out=None):
-        y = g.conv(x, net[i], out=out); outs[i] = y; g.layer_out[i] = y; return y
+    def srcs_of(i):
+        f = net[i].f
+        return [(i - 1 if j == -1 else j) for j in ([f] if isinstance(f, int) else f)]
 
-    # channel widths derived from the actual model (works for n/s/m/...)
-    c4, c6, c10 = och(net[4]), och(net[6]), och(net[10])
-    c13, c17, c20 = och(net[13]), och(net[17]), och(net[20])
+    # pre-pass: per-layer channels and (square) spatial size from module metadata
+    ch, hw = {-1: 3}, {-1: S}
+    for i in range(n_body):
+        mod, srcs = net[i], srcs_of(i)
+        ih = hw[srcs[0]]
+        if isinstance(mod, uconv.Conv):
+            cv = mod.conv
+            ch[i] = cv.out_channels
+            hw[i] = (ih + 2 * cv.padding[0] - cv.kernel_size[0]) // cv.stride[0] + 1
+        elif isinstance(mod, (ublock.C2f, ublock.SPPF, ublock.C2PSA)):
+            ch[i] = mod.cv2.conv.out_channels
+            hw[i] = ih
+        elif isinstance(mod, nn.Upsample):
+            ch[i] = ch[srcs[0]]
+            hw[i] = ih * 2
+        elif isinstance(mod, uconv.Concat):
+            ch[i] = sum(ch[s] for s in srcs)
+            hw[i] = ih
+        else:
+            raise RuntimeError(f'unsupported module {type(mod).__name__} at layer {i}')
 
-    # pre-create concat buffers for head (zero-copy concat)
-    cat12 = g.buf(S // 16, S // 16, c10 + c6)   # up(l10 out) | l6 out
-    cat15 = g.buf(S // 8, S // 8, c13 + c4)     # up(l13 out) | l4 out
-    cat18 = g.buf(S // 16, S // 16, c17 + c13)  # conv17 | l13 out
-    cat21 = g.buf(S // 32, S // 32, c20 + c10)  # conv20 | l10 out
+    # concat fusion: producers write straight into cat-buffer slices; a producer
+    # feeding a second concat keeps the first zero-copy and gets a COPYC for the rest
+    catbuf, feed, feed_copy = {}, {}, {}
+    for i in range(n_body):
+        if not isinstance(net[i], uconv.Concat):
+            continue
+        catbuf[i] = g.buf(hw[i], hw[i], ch[i])
+        off = 0
+        for s in srcs_of(i):
+            if s in feed or s < 0 or isinstance(net[s], uconv.Concat):
+                feed_copy.setdefault(i, []).append((s, off))
+            else:
+                feed[s] = (catbuf[i], off, ch[s])
+            off += ch[s]
 
-    x = conv_layer(0, x)                                    # S/2
-    x = conv_layer(1, x)                                    # S/4
-    x = c3k2(g, x, net[2]); outs[2] = x; g.layer_out[2] = x  # S/4
-    x = conv_layer(3, x)                                    # S/8
-    x = c3k2(g, x, net[4], out=g.ten(cat15, c13, c4)); outs[4] = x; g.layer_out[4] = x
-    x = conv_layer(5, x)                                    # S/16
-    x = c3k2(g, x, net[6], out=g.ten(cat12, c10, c6)); outs[6] = x; g.layer_out[6] = x
-    x = conv_layer(7, x)                                    # S/32
-    x = c3k2(g, x, net[8]); outs[8] = x; g.layer_out[8] = x  # S/32
-    x = sppf(g, x, net[9]); outs[9] = x; g.layer_out[9] = x  # S/32
-    x = c2psa(g, x, net[10], out=g.ten(cat21, c20, c10)); outs[10] = x; g.layer_out[10] = x
+    outs = {-1: x0}
+    for i in range(n_body):
+        mod, srcs = net[i], srcs_of(i)
+        xin = outs[srcs[0]]
+        dst = g.ten(*feed[i]) if i in feed else None
+        if isinstance(mod, uconv.Conv):
+            y = g.conv(xin, mod, out=dst)
+        elif isinstance(mod, ublock.C2PSA):
+            y = c2psa(g, xin, mod, out=dst)
+        elif isinstance(mod, ublock.SPPF):
+            y = sppf(g, xin, mod, out=dst)
+        elif isinstance(mod, ublock.C2f):      # C3k2 subclasses C2f: covers v8 and v11
+            y = c3k2(g, xin, mod, out=dst)
+        elif isinstance(mod, nn.Upsample):
+            assert float(mod.scale_factor) == 2.0
+            y = g.upsample2(xin, dst if dst is not None else g.newt(hw[i], hw[i], ch[i]))
+        else:  # Concat: producers already wrote their slices
+            for s, off in feed_copy.get(i, []):
+                g.copyc(outs[s], g.ten(catbuf[i], off, ch[s]))
+            y = g.ten(catbuf[i], 0, ch[i])
+        outs[i] = y
+        g.layer_out[i] = y
 
-    up11 = g.upsample2(outs[10], g.ten(cat12, 0, c10)); g.layer_out[11] = up11
-    t12 = g.ten(cat12, 0, c10 + c6); g.layer_out[12] = t12
-    l13 = c3k2(g, t12, net[13], out=g.ten(cat18, c17, c13)); outs[13] = l13; g.layer_out[13] = l13
-    up14 = g.upsample2(l13, g.ten(cat15, 0, c13)); g.layer_out[14] = up14
-    t15 = g.ten(cat15, 0, c13 + c4); g.layer_out[15] = t15
-    l16 = c3k2(g, t15, net[16]); outs[16] = l16; g.layer_out[16] = l16   # S/8 (P3)
-    l17 = g.conv(l16, net[17], out=g.ten(cat18, 0, c17)); g.layer_out[17] = l17
-    t18 = g.ten(cat18, 0, c17 + c13); g.layer_out[18] = t18
-    l19 = c3k2(g, t18, net[19]); outs[19] = l19; g.layer_out[19] = l19   # S/16 (P4)
-    l20 = g.conv(l19, net[20], out=g.ten(cat21, 0, c20)); g.layer_out[20] = l20
-    t21 = g.ten(cat21, 0, c20 + c10); g.layer_out[21] = t21
-    l22 = c3k2(g, t21, net[22]); outs[22] = l22; g.layer_out[22] = l22   # S/32 (P5)
+    head = net[-1]
+    if isinstance(head, uhead.Classify):
+        h = g.conv(outs[n_body - 1], head.conv)   # Dropout p=0.0 is an eval no-op
+        _, _, C = g.shape(h)
+        gp = g.gap(h, g.newt(1, 1, C))
+        logits = g.linear(gp, head.linear)
+        probs = g.softmax(logits, g.newt(1, 1, head.linear.out_features))
+        g.layer_out[len(net) - 1] = probs
+        return g
 
-    # Detect / OBB / Segment head
-    det = net[len(net) - 1]
+    # Detect / OBB / Segment head (shared ultralytics classes across v8/v11)
+    det = head
     assert torch.allclose(det.dfl.conv.weight.view(-1), torch.arange(16, dtype=torch.float32))
     obb = isinstance(det, uhead.OBB)
     seg = isinstance(det, uhead.Segment)
-    feats = [l16, l19, l22]
-    strides = [8, 16, 32]
+    feats = [outs[j] for j in det.f]
+    strides = [int(s) for s in det.stride]
     g.det_ref = []
     if seg:
         # Proto on P3: cv1 (3x3 SiLU) -> ConvTranspose2d as 1x1 CONV + PS2 -> cv2 (3x3
-        # SiLU) -> cv3 (1x1 SiLU, unlike the bare-Conv2d head finals) -> [2S/8, 2S/8, nm]
+        # SiLU) -> cv3 (1x1 SiLU, unlike the bare-Conv2d head finals)
         assert det.nm % 8 == 0
-        t = g.conv(l16, det.proto.cv1)
+        t = g.conv(feats[0], det.proto.cv1)
         t = g.conv_transpose2(t, det.proto.upsample)
         t = g.conv(t, det.proto.cv2)
         t_proto = g.conv(t, det.proto.cv3)
         g.seg_ref = {'proto': t_proto, 'cv4': []}
     for i, (f, st) in enumerate(zip(feats, strides)):
-        b = f
-        for m_ in det.cv2[i]:
-            b = g.conv(b, m_)
-        c = f
-        for seq in det.cv3[i][:2]:
-            for m_ in seq:
-                c = g.conv(c, m_)
+        b = emit_chain(g, f, det.cv2[i])
+        c = emit_chain(g, f, det.cv3[i][:2])
         if obb:
             # final cv3/cv4 Couts (nc=15, ne=1) are not %8: zero-pad (k_conv_mma's half2
             # epilogue crashes on odd Cout); the decode kernel reads only the real channels
             c = g.conv_pad(c, det.cv3[i][2], (det.nc + 7) // 8 * 8)
-            a = f
-            for m_ in det.cv4[i][:2]:
-                a = g.conv(a, m_)
+            a = emit_chain(g, f, det.cv4[i][:2])
             a = g.conv_pad(a, det.cv4[i][2], (det.ne + 7) // 8 * 8)
             g.decode_obb(b, c, a, st)
             g.det_ref.append((b, c, a))
         elif seg:
             c = g.conv(c, det.cv3[i][2])
-            mc = f
-            for m_ in det.cv4[i]:              # 3x3 SiLU, 3x3 SiLU, 1x1 no-act -> nm
-                mc = g.conv(mc, m_)
+            mc = emit_chain(g, f, det.cv4[i])  # 3x3 SiLU, 3x3 SiLU, 1x1 no-act -> nm
             g.decode_seg(b, c, mc, st)
             g.seg_ref['cv4'].append(mc)
             g.det_ref.append((b, c, mc))
@@ -386,29 +418,6 @@ def build(net, g, S):
             g.det_ref.append((b, c))
     if seg:
         g.ops.append(('MASKS', t_proto))       # last op: engine assembles masks post-NMS
-    return g
-
-def build_cls(net, g, S):
-    """Classification: detect backbone layers 0..N-2 (all f=-1 sequential) + Classify head."""
-    x = g.newt(S, S, 3)  # tensor 0 = input
-    for i in range(len(net) - 1):
-        mod = net[i]
-        if isinstance(mod, uconv.Conv):
-            x = g.conv(x, mod)
-        elif isinstance(mod, ublock.C3k2):
-            x = c3k2(g, x, mod)
-        elif isinstance(mod, ublock.C2PSA):
-            x = c2psa(g, x, mod)
-        else:
-            raise RuntimeError(type(mod))
-        g.layer_out[i] = x
-    head = net[-1]                          # Classify: conv 1x1 SiLU -> GAP -> linear -> softmax
-    h = g.conv(x, head.conv)                # Dropout p=0.0 is an eval no-op: not emitted
-    _, _, C = g.shape(h)
-    gp = g.gap(h, g.newt(1, 1, C))
-    logits = g.linear(gp, head.linear)
-    probs = g.softmax(logits, g.newt(1, 1, head.linear.out_features))
-    g.layer_out[len(net) - 1] = probs
     return g
 
 
@@ -582,7 +591,7 @@ def main():
 
     g = Graph()
     if task == 'classify':
-        build_cls(net, g, S)
+        build(net, g, S)
     else:
         build(net, g, S)
     nconv = sum(1 for o in g.ops if o[0] == 'CONV')

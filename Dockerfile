@@ -1,5 +1,5 @@
-# yolo11serve container. Build:  docker build -t yolo11serve .
-# Run:  docker run --gpus all -p 50051:50051 -v $(pwd)/build:/app/build yolo11serve
+# yoloserve container. Build:  docker build -t yoloserve .
+# Run:  docker run --gpus all -p 50051:50051 -v $(pwd)/build:/app/build yoloserve
 # (export the model on the host first: make export MODEL=yolo11n)
 ARG CUDA_TAG=13.0.0-devel-ubuntu24.04
 FROM nvidia/cuda:${CUDA_TAG}
@@ -18,5 +18,5 @@ COPY third_party third_party/
 RUN make serve ARCH="${ARCH}"
 
 EXPOSE 50051
-ENTRYPOINT ["./yolo11serve"]
+ENTRYPOINT ["./yoloserve"]
 CMD ["--dir", "build/yolo11n", "--max-batch", "16", "--target-ms", "50"]

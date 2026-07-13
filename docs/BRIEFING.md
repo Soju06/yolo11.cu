@@ -4,7 +4,7 @@ Architecture facts you must know before touching this repo. Read this fully.
 
 ## The pipeline
 
-1. `export/export_yolo11.py <model>` loads the ultralytics model, calls `fuse()` (BN folded into
+1. `export/export.py <model>` loads the ultralytics model, calls `fuse()` (BN folded into
    conv weights), and *decomposes* every composite module into a flat primitive-op graph:
    `CONV, ADD, MAXPOOL5, UPSAMPLE2, COPYC, ATTN, DECODE` — written to `build/<model>/model.graph`
    (text), `weights.f16` (fp16, OHWI = [Cout][kh][kw][Cin]), `bias.f32`.
@@ -16,7 +16,7 @@ Architecture facts you must know before touching this repo. Read this fully.
    asserts <3% max-rel vs the refs (level-2 verification).
 3. Batch dim: buffers sized `net.B ×`; every kernel takes `Bn`; per-B CUDA graphs share buffers.
    `--batch N` on the CLI. Attention loops images (`ATTN` dispatch).
-4. `yolo11serve` (server/serve.cpp) embeds the engine via `engine/yolo11.h` (`-DYOLO11_LIB`).
+4. `yoloserve` (server/serve.cpp) embeds the engine via `engine/yolo.h` (`-DYOLO11_LIB`).
 
 ## Key engine internals
 
@@ -39,7 +39,7 @@ make && make test MODEL=<model>      # per-op compare + detect
 # task-specific end-to-end check vs ultralytics predict outputs (see your spec)
 # regression: the detect path must not change
 make test MODEL=yolo11n
-./yolo11cuda bench build/yolo11n 300   # must stay ~0.90 ms ±3% (cuda graph line)
+./yolocuda bench build/yolo11n 300   # must stay ~0.90 ms ±3% (cuda graph line)
 ```
 
 ## Rules

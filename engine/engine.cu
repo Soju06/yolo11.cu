@@ -1634,8 +1634,8 @@ static uint8_t* loadImageBGR(const std::string& path, int& sh, int& sw) {
 }
 
 static void usage() {
-  printf("yolo11cuda — hand-written CUDA inference engine for YOLO11\n\n"
-         "usage: yolo11cuda <mode> [model-dir] [iters] [--image path] [--batch N]\n\n"
+  printf("yolocuda — hand-written CUDA inference engine for YOLOv8 / YOLO11\n\n"
+         "usage: yolocuda <mode> [model-dir] [iters] [--image path] [--batch N]\n\n"
          "modes:\n"
          "  detect    run one inference, print detections (--image for any jpg/png;\n"
          "            segment: --save-masks writes gpu/masks.u8 + gpu/dets.f32, image 0 only)\n"
@@ -1649,7 +1649,7 @@ static void usage() {
 }
 
 // ------------------------- embedding API (see engine/yolo11.h) -------------------------
-#include "yolo11.h"
+#include "yolo.h"
 
 struct YoloHandle {
   Net net;

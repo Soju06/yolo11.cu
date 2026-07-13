@@ -1,5 +1,6 @@
 build/
 yolo11cuda
+yolocuda
 engine_bin
 *.pt
 __pycache__/
@@ -9,6 +10,7 @@ server/yolo.pb.*
 server/yolo.grpc.pb.*
 engine_lib.o
 yolo11serve
+yoloserve
 nohup.out
 /bus.jpg
 /boats.jpg

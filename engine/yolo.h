@@ -1,4 +1,4 @@
-// Embedding API for the yolo11.cu engine (used by the serving binary).
+// Embedding API for the yolo.cu engine (used by the serving binary).
 #pragma once
 #include <cuda_runtime.h>
 

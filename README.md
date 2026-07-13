@@ -1,6 +1,6 @@
-# yolo11.cu
+# yolo.cu
 
-> **1,100+ FPS object detection on a $400 gaming GPU** — YOLO11, every kernel written by hand in one CUDA file.
+> **1,100+ FPS object detection on a $400 gaming GPU** — YOLOv8 and YOLO11, every kernel written by hand in one CUDA file.
 
 ![CUDA](https://img.shields.io/badge/CUDA-12%2B-76B900?logo=nvidia&logoColor=white)
 ![yolo11n](https://img.shields.io/badge/yolo11n-0.90_ms_%2F_1113_fps-e91e63)
@@ -18,15 +18,15 @@ yolo11n, end-to-end (raw image in → boxes out)
 
 ultralytics predict   ██████████████████████████████████████  14.9 ms
 PyTorch fp16 (cuDNN)  ████████████████                         6.3 ms   (net only!)
-yolo11.cu             ███                                      1.13 ms  ← 13× end-to-end
+yolo.cu               ███                                      1.13 ms  ← 13× end-to-end
 ```
 
-| | yolo11n | yolo11m |
-|---|---|---|
-| ultralytics `predict` (full pipeline) | 14.9 ms | 11.3 ms |
-| PyTorch fp16 eager, **net only** (cuDNN) | 6.26 ms | 9.57 ms |
-| **yolo11.cu, net + decode + NMS** | **0.90 ms** · 1113 fps | **3.87 ms** · 258 fps |
-| **yolo11.cu, end-to-end** | **1.13 ms** · 888 fps | **4.07 ms** · 246 fps |
+| | yolov8n | yolo11n | yolo11m |
+|---|---|---|---|
+| ultralytics `predict` (full pipeline) | — | 14.9 ms | 11.3 ms |
+| PyTorch fp16 eager, **net only** (cuDNN) | 5.08 ms | 6.26 ms | 9.57 ms |
+| **yolo.cu, net + decode + NMS** | **0.94 ms** · 1064 fps | **0.90 ms** · 1113 fps | **3.87 ms** · 258 fps |
+| **yolo.cu, end-to-end** | **1.16 ms** · 864 fps | **1.13 ms** · 888 fps | **4.07 ms** · 246 fps |
 
 *End-to-end* means everything: H2D copy of the raw image, GPU letterboxing, the network, DFL decode, NMS — all captured in **one CUDA graph**, one launch per frame. The host's entire job is `cudaGraphLaunch` + one sync, then reading boxes out of pinned memory.
 
@@ -42,12 +42,12 @@ And it's not a lossy trick: max per-op deviation from a PyTorch fp32 reference i
 ```bash
 pip install ultralytics          # export-time only — the binary needs nothing but a GPU
 make export MODEL=yolo11n        # download weights → build graph + numeric references
-make                             # nvcc → ./yolo11cuda
-./yolo11cuda detect build/yolo11n --image your_photo.jpg
+make                             # nvcc → ./yolocuda
+./yolocuda detect build/yolo11n --image your_photo.jpg
 ```
 
 ```
-$ ./yolo11cuda detect build/yolo11n --image bus.jpg
+$ ./yolocuda detect build/yolo11n --image bus.jpg
 kept=5  (boxes in original image coords)
 cls= 5 score=0.9397 box=(12.1, 228.5, 799.3, 735.1)     # bus
 cls= 0 score=0.9021 box=(48.6, 398.0, 243.3, 904.4)     # person
@@ -55,11 +55,14 @@ cls= 0 score=0.8486 box=(670.6, 392.6, 810.0, 879.7)    # person
 cls= 0 score=0.8336 box=(223.1, 405.6, 345.3, 859.8)    # person
 cls= 0 score=0.3989 box=(-0.1, 550.4, 66.2, 871.7)      # person
 
-$ ./yolo11cuda pipeline build/yolo11n
+$ ./yolocuda pipeline build/yolo11n
 end-to-end pipeline (H2D + preprocess + net + decode + NMS): 1.13 ms/frame (888 fps)
 ```
 
-Want a different scale? `make export MODEL=yolo11l && make test MODEL=yolo11l`. The exporter reads the graph out of the actual ultralytics model — channel widths, attention heads, block repeats — so every scale n/s/m/l/x works from the same code, and task variants compose (`yolo11l-seg` just works).
+Any ultralytics YOLOv8/YOLO11 checkpoint works the same way: `make export MODEL=yolov8s`,
+`MODEL=yolo11l`, `MODEL=yolov8n-seg`… The exporter is a generic topology walker over the model's
+own layer graph — channel widths, block repeats, attention heads, task heads are all read off the
+checkpoint, so scales and task variants compose with zero per-model code.
 
 ## Not just detection
 
@@ -68,15 +71,15 @@ PyTorch fp32 reference and end-to-end against ultralytics:
 
 | task | model | verified against ultralytics | speed (RTX 3060 Ti) |
 |---|---|---|---|
-| detect | `yolo11n` … `yolo11x` | boxes/classes/scores match | 0.90–10.1 ms |
+| detect | `yolov8n`/`yolo11n` … `yolo11x` | boxes/classes/scores match | 0.90–10.1 ms |
 | classify | `yolo11n-cls` (224×224) | top-1/top-2 ids match, Δp ≤ 1.3e-3 | **0.53 ms** e2e |
 | OBB | `yolo11n-obb` (1024×1024) | **169/169 rotated boxes** match (1.3 px / 0.002 rad) | 1.6 ms |
 | segment | `yolo11n-seg` | mask IoU **min 0.999, median 1.000** per instance | 1.21 ms |
 
 ```bash
 make export MODEL=yolo11n-seg && make test MODEL=yolo11n-seg && make test-seg MODEL=yolo11n-seg
-./yolo11cuda detect build/yolo11n-obb --image aerial.jpg    # rotated cx,cy,w,h,angle output
-./yolo11cuda detect build/yolo11n-cls --image photo.jpg     # top-5 classes
+./yolocuda detect build/yolo11n-obb --image aerial.jpg    # rotated cx,cy,w,h,angle output
+./yolocuda detect build/yolo11n-cls --image photo.jpg     # top-5 classes
 ```
 
 Highlights under the hood: classification's linear layer runs as an M=1 GEMM through the same
@@ -96,12 +99,12 @@ batch=1, and the single-frame numbers above are from *after* all of it landed.
 ### 1 · Ultra-low latency — embed the engine
 
 For robotics, video pipelines, or anything that lives frame-to-frame: run batch=1 and embed the
-engine directly. The whole thing is one `.cu` file with a tiny C API (`engine/yolo11.h`) — no
+engine directly. The whole thing is one `.cu` file with a tiny C API (`engine/yolo.h`) — no
 server, no IPC, no Python. Per frame the host does one CUDA-graph launch and one sync; boxes come
 back in pinned memory **1.13 ms** after the raw frame goes in.
 
 ```c
-#include "engine/yolo11.h"
+#include "engine/yolo.h"
 
 void* h = yolo_create("build/yolo11n", /*max_batch=*/1);   // load + autotune + build graph
 
@@ -122,7 +125,7 @@ check — batch support added zero overhead at B=1 (verified: 0.90 ms before and
 
 ### 2 · High throughput — the labeling server
 
-For dataset labeling and offline processing: `yolo11serve` is a
+For dataset labeling and offline processing: `yoloserve` is a
 containerized gRPC server that GPU-decodes JPEGs (nvJPEG, parallel decoder pool), dynamic-batches
 requests, and runs the batched engine. It serves whichever task the model dir was exported for —
 detect boxes, rotated boxes (obb), top-5 classes, or boxes + RLE instance masks (segment) — over
@@ -149,9 +152,9 @@ detect 827 img/s + segment 424 img/s concurrently, both holding p50 ≈ 37 ms.
 ```bash
 sudo apt install libgrpc++-dev protobuf-compiler-grpc libprotobuf-dev
 make serve
-./yolo11serve --dir build/yolo11n --dir build/yolo11n-seg:8 --dir build/yolo11n-cls:4
+./yoloserve --dir build/yolo11n --dir build/yolo11n-seg:8 --dir build/yolo11n-cls:4
 # or containerized:
-docker build -t yolo11serve . && docker run --gpus all -p 50051:50051 -v $(pwd)/build:/app/build yolo11serve
+docker build -t yoloserve . && docker run --gpus all -p 50051:50051 -v $(pwd)/build:/app/build yoloserve
 
 pip install grpcio grpcio-tools
 python3 client/label.py photos/*.jpg --out labels.jsonl -c 64      # mass labeling -> JSONL
@@ -184,7 +187,7 @@ Every claim above is verifiable: `make test` re-derives references from PyTorch 
 ## CLI
 
 ```
-yolo11cuda <mode> [model-dir] [iters] [--image path]
+yolocuda <mode> [model-dir] [iters] [--image path]
 
   detect     one inference, print detections (--image loads any jpg/png, boxes in original coords)
   bench      net-only benchmark, stream launches vs CUDA graph
@@ -218,7 +221,7 @@ Everything was accepted or rejected on Nsight Compute / Systems measurements, an
 
 ```
 engine/engine.cu          the entire engine: graph executor, kernels, CLI  (~1,200 lines)
-export/export_yolo11.py   graph/weight exporter + reference generator
+export/export.py          graph/weight exporter (generic topology walker) + references
 test/compare.py           per-op numeric comparison
 third_party/stb_image.h   vendored jpg/png loader
 build/<model>/            export artifacts (not tracked)
