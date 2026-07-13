@@ -483,10 +483,11 @@ __global__ void __launch_bounds__(WARPS_M * WARPS_N * 32, 2) k_conv_mma(
 
 // first conv: Cin=3, K=3, S=2. Thread computes a 16-channel chunk for one output pixel;
 // blockIdx.y selects the chunk (keeps register pressure flat for wide first convs).
+template<int CHUNK>
 __global__ void k_conv0(const __half* __restrict__ X, int H, int W,
                         __half* __restrict__ Y, int Ho, int Wo, int Cout,
                         const __half* __restrict__ Wt, const float* __restrict__ B, int act, int Bn) {
-  const int CHUNK = 16, CIN = 3, K = 3, S = 2, P = 1;
+  const int CIN = 3, K = 3, S = 2, P = 1;
   const int co0 = blockIdx.y * CHUNK;
   __shared__ __half ws[CHUNK * K * K * CIN];   // 432
   __shared__ float bs[CHUNK];
@@ -525,7 +526,8 @@ __global__ void k_conv0(const __half* __restrict__ X, int H, int W,
 #pragma unroll
   for (int c = 0; c < CHUNK; c++) out[c] = __float2half(actf(acc[c], act));
   uint4* dst = (uint4*)(Y + (size_t)pix * Cout + co0);
-  dst[0] = ((uint4*)out)[0]; dst[1] = ((uint4*)out)[1];
+#pragma unroll
+  for (int i = 0; i < CHUNK / 8; i++) dst[i] = ((uint4*)out)[i];
 }
 
 // vectorized depthwise conv: thread per (pixel, 8-channel group); weights repacked to [K*K][C]
@@ -1261,9 +1263,15 @@ static void runOp(Net& net, const Op& op, cudaStream_t st, int Bn) {
       View x = view(net, op.a), y = view(net, op.out);
       int total = y.H * y.W * op.Cout;
       if (op.g == 1 && op.Cin == 3) {   // first conv
-        dim3 g0((Bn * y.H * y.W + 255) / 256, op.Cout / 16);
-        k_conv0<<<g0, 256, 0, st>>>(x.p, x.H, x.W, (__half*)y.p, y.H, y.W, op.Cout,
-                                    net.weights + op.woff, net.bias + op.boff, op.act, Bn);
+        if (op.Cout % 32 == 0) {
+          dim3 g0((Bn * y.H * y.W + 255) / 256, op.Cout / 32);
+          k_conv0<32><<<g0, 256, 0, st>>>(x.p, x.H, x.W, (__half*)y.p, y.H, y.W, op.Cout,
+                                          net.weights + op.woff, net.bias + op.boff, op.act, Bn);
+        } else {
+          dim3 g0((Bn * y.H * y.W + 255) / 256, op.Cout / 16);
+          k_conv0<16><<<g0, 256, 0, st>>>(x.p, x.H, x.W, (__half*)y.p, y.H, y.W, op.Cout,
+                                          net.weights + op.woff, net.bias + op.boff, op.act, Bn);
+        }
       } else if (op.g == 1 && op.Cin >= 8) {
         View r{};
         bool hasRes = op.b >= 0;
@@ -1297,10 +1305,11 @@ static void runOp(Net& net, const Op& op, cudaStream_t st, int Bn) {
         // 1x1 convs have no im2col amplification — narrow tiles + deep pipeline win there.
         int bwide = ((M + 63) / 64) * ((op.Cout + 127) / 128);
         bool wide = (op.k == 3) && M >= 1600 && op.Cout >= 128 && bwide >= 38;
-        if (wide)                                 LAUNCH_TILE(64, 128, 3, 2, 4);
+        if (op.variant == 3)                      LAUNCH_TILE(64, 128, 3, 2, 4);
+        else if (op.variant == 0 && wide)         LAUNCH_TILE(64, 128, 3, 2, 4);
         else if (op.Cout <= 32 && M >= 6400)      LAUNCH_TILE(64, 32, 3, 2, 2);
-        else if (b64 >= 24) {
-          // 8-warp grid hides barrier/wait stalls on some shapes; autotuner picks per op
+        else if (b64 >= 24 || op.variant) {
+          // tile + warp-grid variants; the startup autotuner picks per op (heuristic if 0)
           bool w8 = op.variant ? (op.variant == 2) : (kone || M > 400);
           if (w8) LAUNCH_TILE(64, 64, 3, 2, 4);
           else    LAUNCH_TILE(64, 64, 3, 2, 2);
@@ -1499,10 +1508,11 @@ static void autotune(Net& net, cudaStream_t st) {
     int M = y.H * y.W;
     int b64 = ((M + 63) / 64) * ((op.Cout + 63) / 64);
     int bwide = ((M + 63) / 64) * ((op.Cout + 127) / 128);
-    bool wide = (op.k == 3) && M >= 1600 && op.Cout >= 128 && bwide >= 38;
-    if ((op.Cout <= 32 && M >= 6400) || wide || b64 < 24) continue;  // not the (64,64) branch
-    float t[2];
-    for (int v = 1; v <= 2; v++) {
+    if ((op.Cout <= 32 && M >= 6400) || b64 < 24) continue;  // fixed-tile branches
+    bool wideOk = op.Cout >= 128 && bwide >= 24;   // (64,128) grid still fills the SMs
+    int nv = wideOk ? 3 : 2;
+    float t[3] = {1e30f, 1e30f, 1e30f};
+    for (int v = 1; v <= nv; v++) {
       op.variant = v;
       runOp(net, op, st, net.B);                // warm
       cudaEventRecord(e0, st);
@@ -1511,8 +1521,10 @@ static void autotune(Net& net, cudaStream_t st) {
       CK(cudaStreamSynchronize(st));
       cudaEventElapsedTime(&t[v - 1], e0, e1);
     }
-    op.variant = (t[0] <= t[1]) ? 1 : 2;
-    tuned++; wide8 += op.variant == 2;
+    op.variant = 1;
+    for (int v = 2; v <= nv; v++)
+      if (t[v - 1] < t[op.variant - 1]) op.variant = v;
+    tuned++; wide8 += op.variant >= 2;
   }
   cudaEventDestroy(e0); cudaEventDestroy(e1);
   printf("autotuned %d convs (%d chose 8-warp grid)\n", tuned, wide8);

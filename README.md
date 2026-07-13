@@ -30,8 +30,10 @@ yolo11.cu             ███                                      1.13 ms  �
 
 *End-to-end* means everything: H2D copy of the raw image, GPU letterboxing, the network, DFL decode, NMS — all captured in **one CUDA graph**, one launch per frame. The host's entire job is `cudaGraphLaunch` + one sync, then reading boxes out of pinned memory.
 
-The big scales run too, with identical boxes: **yolo11l 5.2 ms** (PyTorch fp16: 13.7 ms, 2.6×) and
-**yolo11x 10.1 ms** (14.7 ms, 1.5×) net+decode+NMS.
+The big scales run too, with identical boxes: **yolo11l 5.1 ms** (PyTorch fp16: 13.7 ms, 2.7×) and
+**yolo11x 9.5 ms** (14.7 ms, 1.5×) net+decode+NMS. On the large scales the startup autotuner also
+chooses between tile widths per conv (64×64 vs 64×128), not just warp grids — measured, not
+heuristic.
 
 And it's not a lossy trick: max per-op deviation from a PyTorch fp32 reference is **0.99%** (n) / **1.3%** (m) — the same order as fp16 rounding itself. Detections match ultralytics on real images in boxes, classes, and scores.
 
