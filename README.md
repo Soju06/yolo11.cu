@@ -23,17 +23,18 @@ yolo.cu               ███                                      1.13 ms  �
 
 | | yolov8n | yolo11n | yolo11m |
 |---|---|---|---|
-| ultralytics `predict` (full pipeline) | — | 14.9 ms | 11.3 ms |
+| ultralytics `predict` (full pipeline) | 9.2 ms | 14.9 ms | 11.3 ms |
 | PyTorch fp16 eager, **net only** (cuDNN) | 5.08 ms | 6.26 ms | 9.57 ms |
 | **yolo.cu, net + decode + NMS** | **0.94 ms** · 1064 fps | **0.90 ms** · 1113 fps | **3.87 ms** · 258 fps |
 | **yolo.cu, end-to-end** | **1.16 ms** · 864 fps | **1.13 ms** · 888 fps | **4.07 ms** · 246 fps |
 
 *End-to-end* means everything: H2D copy of the raw image, GPU letterboxing, the network, DFL decode, NMS — all captured in **one CUDA graph**, one launch per frame. The host's entire job is `cudaGraphLaunch` + one sync, then reading boxes out of pinned memory.
 
-The big scales run too, with identical boxes: **yolo11l 5.1 ms** (PyTorch fp16: 13.7 ms, 2.7×) and
-**yolo11x 9.5 ms** (14.7 ms, 1.5×) net+decode+NMS. On the large scales the startup autotuner also
-chooses between tile widths per conv (64×64 vs 64×128), not just warp grids — measured, not
-heuristic.
+The big scales run too, with identical boxes — both families:
+**yolo11l 5.1 ms** (PyTorch fp16: 13.7 ms, 2.7×), **yolo11x 9.5 ms** (14.7 ms, 1.5×),
+**yolov8s 1.85 / v8m 4.2 / v8l 7.3 / v8x 11.4 ms** (v8l/x PyTorch: 10.9 / 16.9 ms, 1.5×).
+On the large scales the startup autotuner also chooses between tile widths per conv
+(64×64 vs 64×128), not just warp grids — measured, not heuristic.
 
 And it's not a lossy trick: max per-op deviation from a PyTorch fp32 reference is **0.99%** (n) / **1.3%** (m) — the same order as fp16 rounding itself. Detections match ultralytics on real images in boxes, classes, and scores.
 
@@ -69,17 +70,19 @@ checkpoint, so scales and task variants compose with zero per-model code.
 All four YOLO11 task heads run on the same hand-written kernels, each verified per-op against a
 PyTorch fp32 reference and end-to-end against ultralytics:
 
-| task | model | verified against ultralytics | speed (RTX 3060 Ti) |
+Every task, both families, each verified end-to-end against ultralytics:
+
+| task | models | verified against ultralytics | speed (RTX 3060 Ti) |
 |---|---|---|---|
-| detect | `yolov8n`/`yolo11n` … `yolo11x` | boxes/classes/scores match | 0.90–10.1 ms |
-| classify | `yolo11n-cls` (224×224) | top-1/top-2 ids match, Δp ≤ 1.3e-3 | **0.53 ms** e2e |
-| OBB | `yolo11n-obb` (1024×1024) | **169/169 rotated boxes** match (1.3 px / 0.002 rad) | 1.6 ms |
-| segment | `yolo11n-seg` | mask IoU **min 0.999, median 1.000** per instance | 1.21 ms |
+| detect | `yolov8n…x`, `yolo11n…x` | boxes/classes/scores match, all 10 checkpoints | 0.90–11.4 ms |
+| classify | `yolov8n-cls`, `yolo11n-cls` (224²) | top-1/2 ids match; Δp ≤ 6e-3 (v8) / 1.3e-3 (v11) | **0.53 ms** e2e |
+| OBB | `yolov8n-obb`, `yolo11n-obb` (1024²) | **171/171** (v8) and **169/169** (v11) rotated boxes | 1.6 ms |
+| segment | `yolov8n-seg`, `yolo11n-seg` | per-instance mask IoU min **0.997** (v8) / **0.999** (v11) | 1.21 ms |
 
 ```bash
-make export MODEL=yolo11n-seg && make test MODEL=yolo11n-seg && make test-seg MODEL=yolo11n-seg
+make export MODEL=yolov8n-seg && make test MODEL=yolov8n-seg && make test-seg MODEL=yolov8n-seg
 ./yolocuda detect build/yolo11n-obb --image aerial.jpg    # rotated cx,cy,w,h,angle output
-./yolocuda detect build/yolo11n-cls --image photo.jpg     # top-5 classes
+./yolocuda detect build/yolov8n-cls --image photo.jpg     # top-5 classes
 ```
 
 Highlights under the hood: classification's linear layer runs as an M=1 GEMM through the same
