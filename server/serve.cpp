@@ -36,21 +36,28 @@ static double ms_since(Clock::time_point a, Clock::time_point b) {
 }
 
 struct Req {
+  int model = 0;
   const std::string* data;
   Clock::time_point arrival, deadline;
   yolo::DetectResponse* resp;
   std::promise<bool> done;   // false = decode failure
 };
 
-struct Server {
-  void* eng;
+struct Model {
+  void* eng = nullptr;
+  std::string name;          // dir basename, request routing key
   int task = 0;              // 0 detect, 1 obb, 2 classify, 3 segment
   const char* taskName = "detect";
+  int maxB = 16;
   int maskH = 0, maskW = 0;  // segment proto resolution
   std::vector<unsigned char> maskBuf;
-  int maxB;
+  std::deque<Req*> q;        // per-model queue (batches never mix models)
+};
+
+struct Server {
+  std::vector<Model> models;
+  int maxB = 16;             // max over models (scratch sizing)
   double targetMs, safetyMs = 1.0;
-  std::deque<Req*> q;
   std::mutex mu;
   std::condition_variable cv;
   std::atomic<long> served{0};
@@ -150,23 +157,37 @@ struct Server {
     std::vector<Req*> batch;
     std::vector<int> ok, hh, ww;
     Clock::time_point tLaunch;
-    int B = 0;
+    int B = 0, model = 0;
   };
 
-  void collect(std::vector<Req*>& batch) {
+  // pick the most urgent model queue: fire when a queue is full or its oldest request's
+  // slack (given that model's calibrated exec time) runs out; otherwise wait for more work.
+  int collect(std::vector<Req*>& batch) {
     std::unique_lock<std::mutex> lk(mu);
-    cv.wait(lk, [&] { return !q.empty(); });
+    cv.wait(lk, [&] { for (auto& m : models) if (!m.q.empty()) return true; return false; });
+    int pick;
     for (;;) {
-      if ((int)q.size() >= maxB) break;
-      // cost if we fired right now vs headroom the oldest request has left
-      double slackMs = targetMs - ms_since(q.front()->arrival, Clock::now())
-                       - yolo_exec_ms(eng, maxB) - decodeEmaMs - safetyMs;
-      if (slackMs <= 0) break;                       // waiting longer risks the SLO — fire
-      cv.wait_for(lk, std::chrono::microseconds(std::min((long)(slackMs * 1000), 200L)));
+      pick = -1;
+      double minSlack = 1e30;
+      bool fire = false;
+      for (int mi = 0; mi < (int)models.size(); mi++) {
+        Model& m = models[mi];
+        if (m.q.empty()) continue;
+        double slack = targetMs - ms_since(m.q.front()->arrival, Clock::now())
+                       - yolo_exec_ms(m.eng, m.maxB) - decodeEmaMs - safetyMs;
+        bool ready = (int)m.q.size() >= m.maxB || slack <= 0;
+        if ((ready && !fire) || (ready == fire && slack < minSlack)) {
+          pick = mi; minSlack = slack; fire = fire || ready;
+        }
+      }
+      if (fire) break;
+      cv.wait_for(lk, std::chrono::microseconds(std::min((long)(minSlack * 1000), 200L)));
     }
-    int B = std::min((int)q.size(), maxB);
-    batch.assign(q.begin(), q.begin() + B);
-    q.erase(q.begin(), q.begin() + B);
+    Model& m = models[pick];
+    int B = std::min((int)m.q.size(), m.maxB);
+    batch.assign(m.q.begin(), m.q.begin() + B);
+    m.q.erase(m.q.begin(), m.q.begin() + B);
+    return pick;
   }
 
   // encode a binary u8 mask as alternating 0/1 run lengths (row-major, starts with a 0-run)
@@ -182,11 +203,14 @@ struct Server {
   }
 
   void respond(Inflight& f, double inferMs) {
+    Model& m = models[f.model];
+    void* eng = m.eng;
+    int task = m.task;
     YoloDet dets[300];
     YoloObbDet rdets[300];
     for (int i = 0; i < f.B; i++) {
       Req* r = f.batch[i];
-      r->resp->set_task(taskName);
+      r->resp->set_task(m.taskName);
       if (f.ok[i]) {
         if (task == 2) {                                     // classify: top-5
           int ids[5]; float probs[5];
@@ -213,13 +237,13 @@ struct Server {
             b->set_score(dets[j].score); b->set_cls(dets[j].cls);
           }
           if (task == 3) {                                   // segment: RLE masks + geometry
-            r->resp->set_mask_h(maskH); r->resp->set_mask_w(maskW);
+            r->resp->set_mask_h(m.maskH); r->resp->set_mask_w(m.maskW);
             float sc; int top, left;
             yolo_slot_geom(eng, i, &sc, &top, &left);
             r->resp->set_lb_scale(sc); r->resp->set_lb_top(top); r->resp->set_lb_left(left);
             for (int j = 0; j < n; j++) {
-              if (yolo_get_mask(eng, i, j, maskBuf.data()) == 0)
-                rleEncode(maskBuf.data(), (size_t)maskH * maskW, r->resp->add_masks());
+              if (yolo_get_mask(eng, i, j, m.maskBuf.data()) == 0)
+                rleEncode(m.maskBuf.data(), (size_t)m.maskH * m.maskW, r->resp->add_masks());
               else
                 r->resp->add_masks();
             }
@@ -241,32 +265,35 @@ struct Server {
     Inflight cur, prev;
     bool havePrev = false;
     for (;;) {
-      collect(cur.batch);
+      cur.model = collect(cur.batch);
       cur.B = (int)cur.batch.size();
       cur.ok.assign(cur.B, 0); cur.hh.assign(cur.B, 0); cur.ww.assign(cur.B, 0);
       auto d0 = Clock::now();
       decodeBatch(cur.batch, cur.ok, cur.hh, cur.ww);     // decoder pool || GPU running prev
       decodeEmaMs = 0.9 * decodeEmaMs + 0.1 * ms_since(d0, Clock::now());
       if (havePrev) {                                     // prev finished while we decoded
-        yolo_sync(eng);
+        yolo_sync(models[prev.model].eng);
         respond(prev, ms_since(prev.tLaunch, Clock::now()));
       }
       for (int i = 0; i < cur.B; i++)                     // engine stream: serializes after prev graph
         if (cur.ok[i]) {
-          if (task == 2) yolo_preprocess_cls(eng, scratch[slotBase + i], cur.hh[i], cur.ww[i], i);
-          else           yolo_preprocess(eng, scratch[slotBase + i], cur.hh[i], cur.ww[i], i);
+          Model& m = models[cur.model];
+          if (m.task == 2) yolo_preprocess_cls(m.eng, scratch[slotBase + i], cur.hh[i], cur.ww[i], i);
+          else             yolo_preprocess(m.eng, scratch[slotBase + i], cur.hh[i], cur.ww[i], i);
         }
       cur.tLaunch = Clock::now();
-      yolo_run_async(eng, cur.B);
+      yolo_run_async(models[cur.model].eng, cur.B);
       prev = std::move(cur);
       havePrev = true;
       slotBase = maxB - slotBase;                         // ping-pong scratch set
       // opportunistic drain: if the queue is empty, finish prev now instead of waiting for traffic
       {
         std::unique_lock<std::mutex> lk(mu);
-        if (q.empty()) {
+        bool empty = true;
+        for (auto& m : models) empty &= m.q.empty();
+        if (empty) {
           lk.unlock();
-          yolo_sync(eng);
+          yolo_sync(models[prev.model].eng);
           respond(prev, ms_since(prev.tLaunch, Clock::now()));
           havePrev = false;
         }
@@ -281,6 +308,13 @@ class YoloService final : public yolo::Yolo::Service {
   grpc::Status Detect(grpc::ServerContext*, const yolo::DetectRequest* req,
                       yolo::DetectResponse* resp) override {
     Req r;
+    if (!req->model().empty()) {
+      r.model = -1;
+      for (int mi = 0; mi < (int)s_->models.size(); mi++)
+        if (s_->models[mi].name == req->model()) { r.model = mi; break; }
+      if (r.model < 0)
+        return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "unknown model: " + req->model());
+    }
     r.data = &req->image();
     r.arrival = Clock::now();
     r.deadline = r.arrival + std::chrono::microseconds((long)(s_->targetMs * 1000));
@@ -288,7 +322,7 @@ class YoloService final : public yolo::Yolo::Service {
     auto fut = r.done.get_future();
     {
       std::lock_guard<std::mutex> lk(s_->mu);
-      s_->q.push_back(&r);
+      s_->models[r.model].q.push_back(&r);
     }
     s_->cv.notify_all();
     bool ok = fut.get();
@@ -301,35 +335,55 @@ class YoloService final : public yolo::Yolo::Service {
 
 int main(int argc, char** argv) {
   setvbuf(stdout, nullptr, _IOLBF, 0);
-  std::string dir = "build/yolo11n", addr = "0.0.0.0:50051";
+  std::string addr = "0.0.0.0:50051";
+  std::vector<std::string> dirs;
   int maxB = 16;
   double targetMs = 50.0;
   for (int i = 1; i < argc; i++) {
     std::string a = argv[i];
-    if (a == "--dir" && i + 1 < argc) dir = argv[++i];
+    if (a == "--dir" && i + 1 < argc) dirs.push_back(argv[++i]);
     else if (a == "--addr" && i + 1 < argc) addr = argv[++i];
     else if (a == "--max-batch" && i + 1 < argc) maxB = atoi(argv[++i]);
     else if (a == "--target-ms" && i + 1 < argc) targetMs = atof(argv[++i]);
-    else { printf("usage: yolo11serve [--dir build/yolo11n] [--addr 0.0.0.0:50051] [--max-batch 16] [--target-ms 50]\n"); return 1; }
+    else {
+      printf("usage: yolo11serve [--dir build/yolo11n[:maxB]]... [--addr 0.0.0.0:50051] "
+             "[--max-batch 16] [--target-ms 50]\n"
+             "multiple --dir flags serve several models from one process; requests route by\n"
+             "the DetectRequest.model field (dir basename), default = first --dir\n");
+      return 1;
+    }
   }
-  // cheap graph-header peek: refuse non-detect dirs BEFORE the expensive engine init
-  // (autotune + CUDA graph capture at max-batch). proto Box is axis-aligned and classify
-  // has no box output; rotated-box RPC is follow-up work. v1 headers (no TASK line) are
-  // detect by construction.
+  if (dirs.empty()) dirs.push_back("build/yolo11n");
+
   Server s;
-  s.maxB = maxB; s.targetMs = targetMs;
-  s.eng = yolo_create(dir.c_str(), maxB);
-  s.task = yolo_task(s.eng);
-  s.taskName = s.task == 1 ? "obb" : s.task == 2 ? "classify" : s.task == 3 ? "segment" : "detect";
-  if (s.task == 3) {
-    yolo_mask_dim(s.eng, &s.maskH, &s.maskW);
-    s.maskBuf.resize((size_t)s.maskH * s.maskW);
+  s.targetMs = targetMs;
+  s.maxB = 1;
+  for (auto spec : dirs) {
+    Model m;
+    m.maxB = maxB;
+    size_t colon = spec.rfind(':');
+    if (colon != std::string::npos && colon > spec.rfind('/')) {   // per-model :maxB suffix
+      m.maxB = atoi(spec.c_str() + colon + 1);
+      spec = spec.substr(0, colon);
+    }
+    size_t slash = spec.find_last_of('/');
+    m.name = slash == std::string::npos ? spec : spec.substr(slash + 1);
+    m.eng = yolo_create(spec.c_str(), m.maxB);
+    m.task = yolo_task(m.eng);
+    m.taskName = m.task == 1 ? "obb" : m.task == 2 ? "classify" : m.task == 3 ? "segment" : "detect";
+    if (m.task == 3) {
+      yolo_mask_dim(m.eng, &m.maskH, &m.maskW);
+      m.maskBuf.resize((size_t)m.maskH * m.maskW);
+    }
+    printf("model '%s': task=%s max-batch=%d\n", m.name.c_str(), m.taskName, m.maxB);
+    s.maxB = std::max(s.maxB, m.maxB);
+    s.models.push_back(std::move(m));
   }
   if (nvjpegCreateSimple(&s.nvj) != NVJPEG_STATUS_SUCCESS) {
     fprintf(stderr, "nvjpeg init failed\n"); return 1;
   }
-  s.scratch.assign(2 * maxB, nullptr);   // ping-pong slot sets for the decode/infer pipeline
-  s.scratchSz.assign(2 * maxB, 0);
+  s.scratch.assign(2 * s.maxB, nullptr);   // ping-pong slot sets for the decode/infer pipeline
+  s.scratchSz.assign(2 * s.maxB, 0);
   s.nDecoders = std::min(8u, std::max(2u, std::thread::hardware_concurrency() - 2));
   for (int i = 0; i < s.nDecoders; i++) std::thread([&] { s.decoderThread(); }).detach();
   std::thread worker([&] { s.worker(); });
@@ -340,8 +394,8 @@ int main(int argc, char** argv) {
   b.SetMaxReceiveMessageSize(64 << 20);
   b.RegisterService(&svc);
   auto server = b.BuildAndStart();
-  printf("yolo11serve listening on %s (model=%s, max-batch=%d, target=%.0f ms)\n",
-         addr.c_str(), dir.c_str(), maxB, targetMs);
+  printf("yolo11serve listening on %s (%zu models, target=%.0f ms)\n",
+         addr.c_str(), s.models.size(), targetMs);
   server->Wait();
   worker.join();
   return 0;

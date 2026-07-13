@@ -137,15 +137,22 @@ batch fills. Throughput is maximized subject to the latency target; under light 
 gracefully to small, fast batches. Decode of batch *k+1* overlaps GPU execution of batch *k*
 (2-stage pipeline, ping-pong scratch buffers).
 
+One process can serve several models at once — requests route by the `model` field and the
+scheduler deadline-prioritizes across the per-model queues. Measured mixed load on one GPU:
+detect 827 img/s + segment 424 img/s concurrently, both holding p50 ≈ 37 ms.
+
 ```bash
 sudo apt install libgrpc++-dev protobuf-compiler-grpc libprotobuf-dev
-make serve && ./yolo11serve --dir build/yolo11n --max-batch 16 --target-ms 50
+make serve
+./yolo11serve --dir build/yolo11n --dir build/yolo11n-seg:8 --dir build/yolo11n-cls:4
 # or containerized:
 docker build -t yolo11serve . && docker run --gpus all -p 50051:50051 -v $(pwd)/build:/app/build yolo11serve
 
 pip install grpcio grpcio-tools
-python3 client/label.py photos/*.jpg --out labels.jsonl -c 64   # mass labeling -> JSONL
-python3 client/label.py bus.jpg --bench 8000 -c 64              # throughput/latency benchmark
+python3 client/label.py photos/*.jpg --out labels.jsonl -c 64      # mass labeling -> JSONL
+python3 client/label.py photos/*.jpg --model yolo11n-seg \
+        --coco annotations.json -c 64                              # COCO JSON (mask polygons!)
+python3 client/label.py bus.jpg --bench 8000 -c 64                 # throughput/latency benchmark
 ```
 
 Batched engine (the foundation — `--batch N` on the CLI too):
