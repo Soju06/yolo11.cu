@@ -28,6 +28,14 @@ void yolo_run_async(void* h, int B);
 void yolo_sync(void* h);
 // Fetch detections for a slot, mapped back to original image coordinates. Returns count.
 int yolo_get(void* h, int slot, YoloDet* out, int cap);
+// Classify-model preprocessing (resize-shortest + center-crop; use instead of
+// yolo_preprocess on classify handles).
+void yolo_preprocess_cls(void* h, const unsigned char* dev_bgr, int height, int width, int slot);
+// Top-k classes for a slot (classify handles). Returns entries written.
+int yolo_get_cls(void* h, int slot, int* ids, float* probs, int k);
+// Letterbox geometry of a slot (scale/top/left set by yolo_preprocess) — map segment masks
+// (letterbox space, proto resolution) back to original coords with it.
+void yolo_slot_geom(void* h, int slot, float* scale, int* top, int* left);
 // OBB variant: rotated boxes (center xy, wh, angle in radians), original image coords
 // (angle unchanged, no clipping — matches ultralytics scale_boxes(xywh=True)).
 int yolo_get_obb(void* h, int slot, YoloObbDet* out, int cap);

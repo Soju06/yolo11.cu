@@ -1741,6 +1741,31 @@ extern "C" int yolo_get_mask(void* p, int slot, int det, unsigned char* out) {
   return 0;
 }
 
+// classify-model preprocessing (torchvision resize-shortest + center-crop geometry)
+extern "C" void yolo_preprocess_cls(void* p, const unsigned char* dev_bgr, int sh, int sw, int slot) {
+  auto* h = (YoloHandle*)p;
+  Buf& ib = h->net.bufs[h->net.tens[0].buf];
+  ClsGeom gm = clsGeom(ib.H, sh, sw);
+  k_preprocess_cls<<<(ib.H * ib.W + 255) / 256, 256, 0, h->st>>>(
+      dev_bgr, sh, sw, ib.p + (size_t)slot * ib.H * ib.W * ib.C, ib.H, gm.rh, gm.rw, gm.top, gm.left);
+}
+
+// top-k class ids + probs for a slot (classify models). Returns count written.
+extern "C" int yolo_get_cls(void* p, int slot, int* ids, float* probs, int k) {
+  const Net& n = ((YoloHandle*)p)->net;
+  if (!n.cls) return 0;
+  k = std::min(k, n.nc);
+  topk(n, slot, k, ids, probs);
+  return k;
+}
+
+// letterbox geometry of a slot (set by yolo_preprocess) — needed to map segment masks,
+// which live in letterbox space at proto resolution, back to original image coords.
+extern "C" void yolo_slot_geom(void* p, int slot, float* scale, int* top, int* left) {
+  const auto& sm = ((YoloHandle*)p)->slots[slot];
+  *scale = sm.scale; *top = sm.top; *left = sm.left;
+}
+
 extern "C" int yolo_get_obb(void* p, int slot, YoloObbDet* out, int cap) {
   auto* h = (YoloHandle*)p;
   const auto& sm = h->slots[slot];

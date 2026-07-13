@@ -44,6 +44,10 @@ struct Req {
 
 struct Server {
   void* eng;
+  int task = 0;              // 0 detect, 1 obb, 2 classify, 3 segment
+  const char* taskName = "detect";
+  int maskH = 0, maskW = 0;  // segment proto resolution
+  std::vector<unsigned char> maskBuf;
   int maxB;
   double targetMs, safetyMs = 1.0;
   std::deque<Req*> q;
@@ -165,17 +169,61 @@ struct Server {
     q.erase(q.begin(), q.begin() + B);
   }
 
+  // encode a binary u8 mask as alternating 0/1 run lengths (row-major, starts with a 0-run)
+  static void rleEncode(const unsigned char* m, size_t n, yolo::Mask* out) {
+    unsigned char cur = 0;
+    uint32_t run = 0;
+    for (size_t i = 0; i < n; i++) {
+      if (m[i] == cur) { run++; continue; }
+      out->add_rle(run);
+      cur = m[i]; run = 1;
+    }
+    out->add_rle(run);
+  }
+
   void respond(Inflight& f, double inferMs) {
     YoloDet dets[300];
+    YoloObbDet rdets[300];
     for (int i = 0; i < f.B; i++) {
       Req* r = f.batch[i];
+      r->resp->set_task(taskName);
       if (f.ok[i]) {
-        int n = yolo_get(eng, i, dets, 300);
-        for (int j = 0; j < n; j++) {
-          auto* b = r->resp->add_boxes();
-          b->set_x1(dets[j].x1); b->set_y1(dets[j].y1);
-          b->set_x2(dets[j].x2); b->set_y2(dets[j].y2);
-          b->set_score(dets[j].score); b->set_cls(dets[j].cls);
+        if (task == 2) {                                     // classify: top-5
+          int ids[5]; float probs[5];
+          int n = yolo_get_cls(eng, i, ids, probs, 5);
+          for (int j = 0; j < n; j++) {
+            auto* c = r->resp->add_classes();
+            c->set_id(ids[j]); c->set_prob(probs[j]);
+          }
+        } else if (task == 1) {                              // obb: rotated boxes
+          int n = yolo_get_obb(eng, i, rdets, 300);
+          for (int j = 0; j < n; j++) {
+            auto* b = r->resp->add_rboxes();
+            b->set_cx(rdets[j].x); b->set_cy(rdets[j].y);
+            b->set_w(rdets[j].w); b->set_h(rdets[j].h);
+            b->set_angle(rdets[j].angle);
+            b->set_score(rdets[j].score); b->set_cls(rdets[j].cls);
+          }
+        } else {                                             // detect / segment: boxes
+          int n = yolo_get(eng, i, dets, 300);
+          for (int j = 0; j < n; j++) {
+            auto* b = r->resp->add_boxes();
+            b->set_x1(dets[j].x1); b->set_y1(dets[j].y1);
+            b->set_x2(dets[j].x2); b->set_y2(dets[j].y2);
+            b->set_score(dets[j].score); b->set_cls(dets[j].cls);
+          }
+          if (task == 3) {                                   // segment: RLE masks + geometry
+            r->resp->set_mask_h(maskH); r->resp->set_mask_w(maskW);
+            float sc; int top, left;
+            yolo_slot_geom(eng, i, &sc, &top, &left);
+            r->resp->set_lb_scale(sc); r->resp->set_lb_top(top); r->resp->set_lb_left(left);
+            for (int j = 0; j < n; j++) {
+              if (yolo_get_mask(eng, i, j, maskBuf.data()) == 0)
+                rleEncode(maskBuf.data(), (size_t)maskH * maskW, r->resp->add_masks());
+              else
+                r->resp->add_masks();
+            }
+          }
         }
       }
       r->resp->set_queue_ms((float)ms_since(r->arrival, f.tLaunch));
@@ -204,7 +252,10 @@ struct Server {
         respond(prev, ms_since(prev.tLaunch, Clock::now()));
       }
       for (int i = 0; i < cur.B; i++)                     // engine stream: serializes after prev graph
-        if (cur.ok[i]) yolo_preprocess(eng, scratch[slotBase + i], cur.hh[i], cur.ww[i], i);
+        if (cur.ok[i]) {
+          if (task == 2) yolo_preprocess_cls(eng, scratch[slotBase + i], cur.hh[i], cur.ww[i], i);
+          else           yolo_preprocess(eng, scratch[slotBase + i], cur.hh[i], cur.ww[i], i);
+        }
       cur.tLaunch = Clock::now();
       yolo_run_async(eng, cur.B);
       prev = std::move(cur);
@@ -265,26 +316,14 @@ int main(int argc, char** argv) {
   // (autotune + CUDA graph capture at max-batch). proto Box is axis-aligned and classify
   // has no box output; rotated-box RPC is follow-up work. v1 headers (no TASK line) are
   // detect by construction.
-  {
-    char task[16] = "detect";
-    FILE* f = fopen((dir + "/model.graph").c_str(), "r");
-    if (f) {
-      char magic[32]; int ver = 0;
-      if (fscanf(f, "%31s %d", magic, &ver) == 2 && ver >= 2 &&
-          fscanf(f, "%*s %15s", task) != 1) snprintf(task, sizeof task, "unknown");
-      fclose(f);
-    }
-    if (strcmp(task, "detect") != 0) {
-      fprintf(stderr, "server supports detect models only (got '%s' model dir)\n", task);
-      return 1;
-    }
-  }
   Server s;
   s.maxB = maxB; s.targetMs = targetMs;
   s.eng = yolo_create(dir.c_str(), maxB);
-  if (yolo_task(s.eng) != 0) {   // backstop for dirs the peek could not read
-    fprintf(stderr, "server supports detect models only\n");
-    return 1;
+  s.task = yolo_task(s.eng);
+  s.taskName = s.task == 1 ? "obb" : s.task == 2 ? "classify" : s.task == 3 ? "segment" : "detect";
+  if (s.task == 3) {
+    yolo_mask_dim(s.eng, &s.maskH, &s.maskW);
+    s.maskBuf.resize((size_t)s.maskH * s.maskW);
   }
   if (nvjpegCreateSimple(&s.nvj) != NVJPEG_STATUS_SUCCESS) {
     fprintf(stderr, "nvjpeg init failed\n"); return 1;

@@ -78,8 +78,9 @@ Highlights under the hood: classification's linear layer runs as an M=1 GEMM thr
 tensor-core kernel; OBB replicates ultralytics' probiou fast-NMS on device to 3.6e-7; segmentation
 rewrites Proto's ConvTranspose as a 1×1 conv + pixel-shuffle so it also rides the GEMM kernel, and
 assembles masks on GPU for NMS survivors only. Input size is fully generic (`make export
-MODEL=yolo11n IMGSZ=1024`). The gRPC server currently serves detect models; cls/obb/seg serving is
-follow-up work.
+MODEL=yolo11n IMGSZ=1024`). The gRPC server serves all four tasks — the response carries plain
+boxes, rotated boxes, top-5 classes, or RLE-encoded instance masks depending on the model dir it
+was started with.
 
 ## Two ways to use it
 
@@ -118,8 +119,9 @@ check — batch support added zero overhead at B=1 (verified: 0.90 ms before and
 
 For dataset labeling and offline processing: `yolo11serve` is a
 containerized gRPC server that GPU-decodes JPEGs (nvJPEG, parallel decoder pool), dynamic-batches
-requests, and runs the batched engine. Measured on the same RTX 3060 Ti, raw JPEG bytes in →
-boxes out over gRPC:
+requests, and runs the batched engine. It serves whichever task the model dir was exported for —
+detect boxes, rotated boxes (obb), top-5 classes, or boxes + RLE instance masks (segment) — over
+one RPC. Measured on the same RTX 3060 Ti, raw JPEG bytes in → results out over gRPC:
 
 ```
 64 concurrent clients   1,123 img/s   p50  55 ms          (67,000+ labeled images/minute)

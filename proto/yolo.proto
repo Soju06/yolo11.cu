@@ -19,9 +19,37 @@ message Box {
   int32 cls = 6;               // COCO class id
 }
 
+message RBox {                 // oriented box (obb task), original image coordinates
+  float cx = 1;
+  float cy = 2;
+  float w = 3;
+  float h = 4;
+  float angle = 5;             // radians
+  float score = 6;
+  int32 cls = 7;
+}
+
+message ClassProb {            // classify task
+  int32 id = 1;
+  float prob = 2;
+}
+
+message Mask {                 // segment task: binary mask at proto resolution, letterbox space,
+  repeated uint32 rle = 1;     // alternating 0/1 run lengths, row-major, starting with a 0-run
+}
+
 message DetectResponse {
   repeated Box boxes = 1;
   float queue_ms = 2;          // time spent waiting in the batcher
   float infer_ms = 3;          // GPU batch execution time
   int32 batch = 4;             // batch size this request rode in
+  string task = 5;             // detect | classify | obb | segment
+  repeated RBox rboxes = 6;    // obb only
+  repeated ClassProb classes = 7;  // classify only (top-5)
+  repeated Mask masks = 8;     // segment only, parallel to boxes
+  uint32 mask_h = 9;           // segment: proto-resolution mask dims
+  uint32 mask_w = 10;
+  float lb_scale = 11;         // segment: letterbox geometry to map masks to original coords:
+  int32 lb_top = 12;           // original = ((mask_px * 4) - lb_left|lb_top) / lb_scale
+  int32 lb_left = 13;
 }

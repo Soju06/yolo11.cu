@@ -59,8 +59,20 @@ def main():
     results = {}
     def label(path):
         r = stub.Detect(pb.DetectRequest(image=open(path, 'rb').read()))
-        results[path] = [dict(x1=b.x1, y1=b.y1, x2=b.x2, y2=b.y2, score=b.score, cls=b.cls)
-                         for b in r.boxes]
+        out = {'task': r.task or 'detect'}
+        if r.classes:
+            out['classes'] = [dict(id=c.id, prob=c.prob) for c in r.classes]
+        elif r.rboxes:
+            out['rboxes'] = [dict(cx=b.cx, cy=b.cy, w=b.w, h=b.h, angle=b.angle,
+                                  score=b.score, cls=b.cls) for b in r.rboxes]
+        else:
+            out['boxes'] = [dict(x1=b.x1, y1=b.y1, x2=b.x2, y2=b.y2, score=b.score, cls=b.cls)
+                            for b in r.boxes]
+            if r.masks:
+                out['mask_h'], out['mask_w'] = r.mask_h, r.mask_w
+                out['letterbox'] = dict(scale=r.lb_scale, top=r.lb_top, left=r.lb_left)
+                out['masks'] = [list(m.rle) for m in r.masks]
+        results[path] = out
     t0 = time.perf_counter()
     with ThreadPoolExecutor(args.concurrency) as ex:
         list(ex.map(label, args.images))
@@ -68,8 +80,8 @@ def main():
     print(f"labeled {len(args.images)} images in {dt:.2f}s ({len(args.images)/dt:,.0f} img/s)")
     if args.out:
         with open(args.out, 'w') as f:
-            for p, boxes in results.items():
-                f.write(json.dumps({'image': p, 'boxes': boxes}) + '\n')
+            for p, res in results.items():
+                f.write(json.dumps({'image': p, **res}) + '\n')
         print(f"wrote {args.out}")
 
 if __name__ == '__main__':
