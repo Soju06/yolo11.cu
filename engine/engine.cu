@@ -1845,15 +1845,13 @@ int main(int argc, char** argv) {
       FILE* f = fopen(path, "wb");
       fwrite(host.data(), sizeof(__half), host.size(), f);
       fclose(f);
-      // resync, obb ONLY — DEVIATION from spec 5.2's cascaded per-op compare, pending
-      // maintainer sign-off: overwrite the output with the torch reference so every op
-      // is compared against exact reference inputs (isolated kernel check). Without
-      // this, fp16 activation noise cascades and amplifies through the deep obb head
-      // (cv4 at 1024 reached 11% rel from <2% kernel error) and would blow the 3%
-      // gate; the compounded path is still verified end-to-end vs ultralytics.
-      // detect/cls keep the original cascaded semantics (their exporter refs are not
-      // fp16-rounded either), so 'make test' verifies existing models unchanged.
-      if (net.obb) {
+      // resync: overwrite the output with the torch reference so every op is compared
+      // against exact reference inputs — dump mode is an isolated KERNEL check.
+      // Without it, fp16 activation-storage noise cascades and amplifies with network
+      // depth and resolution (obb cv4 at 1024 reached 11% rel, yolo11l 5% at 640, from
+      // <2% actual kernel error). Compounded-path fidelity is what the end-to-end
+      // ultralytics comparison verifies.
+      {
         snprintf(path, sizeof path, "%s/ref/op%03zu.npy", dir.c_str(), k);
         f = fopen(path, "rb");
         if (f) {

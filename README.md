@@ -30,6 +30,9 @@ yolo11.cu             ███                                      1.13 ms  �
 
 *End-to-end* means everything: H2D copy of the raw image, GPU letterboxing, the network, DFL decode, NMS — all captured in **one CUDA graph**, one launch per frame. The host's entire job is `cudaGraphLaunch` + one sync, then reading boxes out of pinned memory.
 
+The big scales run too, with identical boxes: **yolo11l 5.2 ms** (PyTorch fp16: 13.7 ms, 2.6×) and
+**yolo11x 10.1 ms** (14.7 ms, 1.5×) net+decode+NMS.
+
 And it's not a lossy trick: max per-op deviation from a PyTorch fp32 reference is **0.99%** (n) / **1.3%** (m) — the same order as fp16 rounding itself. Detections match ultralytics on real images in boxes, classes, and scores.
 
 ## Try it (60 seconds)
@@ -54,7 +57,7 @@ $ ./yolo11cuda pipeline build/yolo11n
 end-to-end pipeline (H2D + preprocess + net + decode + NMS): 1.13 ms/frame (888 fps)
 ```
 
-Want a different scale? `make export MODEL=yolo11m && make test MODEL=yolo11m`. The exporter reads the graph out of the actual ultralytics model — channel widths, attention heads, block layouts — so n/s/m all work from the same code.
+Want a different scale? `make export MODEL=yolo11l && make test MODEL=yolo11l`. The exporter reads the graph out of the actual ultralytics model — channel widths, attention heads, block repeats — so every scale n/s/m/l/x works from the same code, and task variants compose (`yolo11l-seg` just works).
 
 ## Not just detection
 
@@ -63,7 +66,7 @@ PyTorch fp32 reference and end-to-end against ultralytics:
 
 | task | model | verified against ultralytics | speed (RTX 3060 Ti) |
 |---|---|---|---|
-| detect | `yolo11n` … `yolo11m` | boxes/classes/scores match | 0.90 ms |
+| detect | `yolo11n` … `yolo11x` | boxes/classes/scores match | 0.90–10.1 ms |
 | classify | `yolo11n-cls` (224×224) | top-1/top-2 ids match, Δp ≤ 1.3e-3 | **0.53 ms** e2e |
 | OBB | `yolo11n-obb` (1024×1024) | **169/169 rotated boxes** match (1.3 px / 0.002 rad) | 1.6 ms |
 | segment | `yolo11n-seg` | mask IoU **min 0.999, median 1.000** per instance | 1.21 ms |
