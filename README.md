@@ -56,6 +56,31 @@ end-to-end pipeline (H2D + preprocess + net + decode + NMS): 1.13 ms/frame (888 
 
 Want a different scale? `make export MODEL=yolo11m && make test MODEL=yolo11m`. The exporter reads the graph out of the actual ultralytics model — channel widths, attention heads, block layouts — so n/s/m all work from the same code.
 
+## Not just detection
+
+All four YOLO11 task heads run on the same hand-written kernels, each verified per-op against a
+PyTorch fp32 reference and end-to-end against ultralytics:
+
+| task | model | verified against ultralytics | speed (RTX 3060 Ti) |
+|---|---|---|---|
+| detect | `yolo11n` … `yolo11m` | boxes/classes/scores match | 0.90 ms |
+| classify | `yolo11n-cls` (224×224) | top-1/top-2 ids match, Δp ≤ 1.3e-3 | **0.53 ms** e2e |
+| OBB | `yolo11n-obb` (1024×1024) | **169/169 rotated boxes** match (1.3 px / 0.002 rad) | 1.6 ms |
+| segment | `yolo11n-seg` | mask IoU **min 0.999, median 1.000** per instance | 1.21 ms |
+
+```bash
+make export MODEL=yolo11n-seg && make test MODEL=yolo11n-seg && make test-seg MODEL=yolo11n-seg
+./yolo11cuda detect build/yolo11n-obb --image aerial.jpg    # rotated cx,cy,w,h,angle output
+./yolo11cuda detect build/yolo11n-cls --image photo.jpg     # top-5 classes
+```
+
+Highlights under the hood: classification's linear layer runs as an M=1 GEMM through the same
+tensor-core kernel; OBB replicates ultralytics' probiou fast-NMS on device to 3.6e-7; segmentation
+rewrites Proto's ConvTranspose as a 1×1 conv + pixel-shuffle so it also rides the GEMM kernel, and
+assembles masks on GPU for NMS survivors only. Input size is fully generic (`make export
+MODEL=yolo11n IMGSZ=1024`). The gRPC server currently serves detect models; cls/obb/seg serving is
+follow-up work.
+
 ## Two ways to use it
 
 YOLO deployments split into two very different shapes. This repo ships a dedicated path for each —
