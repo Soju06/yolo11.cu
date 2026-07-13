@@ -30,7 +30,8 @@
 // ------------------------- graph structures -------------------------
 struct Buf  { int H, W, C; __half* p = nullptr; };
 struct Ten  { int buf, coff, C; };
-enum OpKind { CONV, ADD, MAXPOOL5, UPSAMPLE2, COPYC, ATTN, DECODE, GAP, SOFTMAX, DECODEOBB };
+enum OpKind { CONV, ADD, MAXPOOL5, UPSAMPLE2, COPYC, ATTN, DECODE, GAP, SOFTMAX, DECODEOBB,
+              PS2, DECODESEG, MASKS };
 struct Op {
   OpKind kind;
   int a = -1, b = -1, out = -1;        // tensor ids (CONV: a=in, out; ADD: a,b,out)
@@ -48,7 +49,11 @@ struct Net {
   char task[16] = "detect";    // v2 header; v1 default
   int cls = 0;                 // task == "classify"
   int obb = 0;                 // task == "obb": 7-float rotated dets, probiou NMS
-  int detK() const { return obb ? 7 : 6; }   // floats per det record
+  int seg = 0;                 // task == "segment": 6+nm-float candidates, post-NMS masks
+  int nm = 0;                  // mask coefficient count (MASKS op; 0 = no masks)
+  int protoTen = -1;           // segment: proto tensor named by the MASKS op
+  int detStride = 6;           // floats per CANDIDATE record (obb 7, segment 6+nm)
+  int detK() const { return obb ? 7 : 6; }   // floats per OUTPUT det record
   int probsTen = -1;           // classify: SOFTMAX output tensor (standalone [1,1,nc] buffer)
   __half* h_probs = nullptr;   // pinned host probs [B][nc] (copied inside the graph)
   std::vector<Buf> bufs;
@@ -60,6 +65,8 @@ struct Net {
   int*    detcnt = nullptr;    // device counter
   float*  outdets = nullptr;   // device NMS output [MAX_OUT*6]
   int*    outcnt = nullptr;
+  int*    outidx = nullptr;    // NMS survivor -> candidate slot [B][MAX_OUT]
+  uint8_t* masks = nullptr;    // segment: survivor masks [B][MAX_OUT][Ph][Pw], device only
   float*  h_out = nullptr;     // pinned host mirrors (copied inside the graph)
   int*    h_cnt = nullptr;
   int*    h_rawcnt = nullptr;  // pre-NMS candidate count (NMS_CAP truncation tripwire)
@@ -117,6 +124,14 @@ static void loadGraph(Net& net, const std::string& dir) {
     } else if (!strcmp(tag, "DECODEOBB")) {
       op.kind = DECODEOBB;   // a = box view, b = padded cls view, out = padded angle view
       if (fscanf(f, "%d %d %d %d", &op.a, &op.b, &op.out, &op.stride) != 4) exit(1);
+    } else if (!strcmp(tag, "PS2")) {
+      op.kind = PS2; if (fscanf(f, "%d %d", &op.a, &op.out) != 2) exit(1);
+    } else if (!strcmp(tag, "DECODESEG")) {
+      op.kind = DECODESEG;   // a = box view, b = cls view, out = mask-coef view
+      if (fscanf(f, "%d %d %d %d", &op.a, &op.b, &op.out, &op.stride) != 4) exit(1);
+    } else if (!strcmp(tag, "MASKS")) {
+      op.kind = MASKS;       // a = proto view; assembly runs post-NMS in forward()
+      if (fscanf(f, "%d", &op.a) != 1) exit(1);
     } else if (!strcmp(tag, "GAP")) {
       op.kind = GAP; if (fscanf(f, "%d %d", &op.a, &op.out) != 2) exit(1);
     } else if (!strcmp(tag, "SOFTMAX")) {
@@ -141,6 +156,7 @@ static void loadGraph(Net& net, const std::string& dir) {
 
   net.cls = !strcmp(net.task, "classify");
   net.obb = !strcmp(net.task, "obb");
+  net.seg = !strcmp(net.task, "segment");
   // obb: cls/angle views are zero-padded to %8 (k_conv_mma epilogue); decode reads nc/1 real
   // channels out of them
   for (const Op& op : net.ops)
@@ -149,6 +165,17 @@ static void loadGraph(Net& net, const std::string& dir) {
       fprintf(stderr, "DECODEOBB needs task=obb and %%8-padded cls/angle views covering nc=%d\n",
               net.nc); exit(1);
     }
+  // segment: the MASKS op names the proto tensor and fixes nm = proto channel count
+  for (const Op& op : net.ops)
+    if (op.kind == MASKS) { net.protoTen = op.a; net.nm = net.tens[op.a].C; }
+  for (const Op& op : net.ops)
+    if (op.kind == DECODESEG &&
+        (!net.seg || net.protoTen < 0 || net.nc % 8 || net.tens[op.b].C != net.nc ||
+         net.tens[op.out].C != net.nm || net.nm != 32)) {   // k_decode<32> is the only NM inst.
+      fprintf(stderr, "DECODESEG needs task=segment, a MASKS op, nc %% 8 == 0 and nm == 32 "
+              "(nc=%d nm=%d coef C=%d)\n", net.nc, net.nm, net.tens[op.out].C); exit(1);
+    }
+  net.detStride = net.obb ? 7 : 6 + net.nm;
   if (net.cls) {
     for (const Op& op : net.ops)
       if (op.kind == SOFTMAX) net.probsTen = op.out;
@@ -181,10 +208,15 @@ static void loadGraph(Net& net, const std::string& dir) {
   }
   CK(cudaMalloc(&net.weights, wf.size())); CK(cudaMemcpy(net.weights, wf.data(), wf.size(), cudaMemcpyHostToDevice));
   CK(cudaMalloc(&net.bias, bf.size()));    CK(cudaMemcpy(net.bias, bf.data(), bf.size(), cudaMemcpyHostToDevice));
-  CK(cudaMalloc(&net.dets, (size_t)net.B * Net::MAXDET * net.detK() * sizeof(float)));
+  CK(cudaMalloc(&net.dets, (size_t)net.B * Net::MAXDET * net.detStride * sizeof(float)));
   CK(cudaMalloc(&net.detcnt, net.B * sizeof(int)));
   CK(cudaMalloc(&net.outdets, (size_t)net.B * 300 * net.detK() * sizeof(float)));
   CK(cudaMalloc(&net.outcnt, net.B * sizeof(int)));
+  CK(cudaMalloc(&net.outidx, (size_t)net.B * MAX_OUT * sizeof(int)));
+  if (net.protoTen >= 0) {   // survivor masks at proto resolution, device-resident only
+    const Buf& pb = net.bufs[net.tens[net.protoTen].buf];
+    CK(cudaMalloc(&net.masks, (size_t)net.B * MAX_OUT * pb.H * pb.W));
+  }
   CK(cudaMallocHost(&net.h_out, (size_t)net.B * 300 * net.detK() * sizeof(float)));
   CK(cudaMallocHost(&net.h_cnt, net.B * sizeof(int)));
   CK(cudaMallocHost(&net.h_rawcnt, net.B * sizeof(int)));
@@ -672,6 +704,23 @@ __global__ void k_upsample2(const __half* X, int xs, int xo, __half* Y, int ys, 
       *(const uint4*)(X + ((size_t)(brow + (oy >> 1)) * W + (ox >> 1)) * xs + xo + c);
 }
 
+// pixel shuffle r=2 from quadrant channel blocks: in [H,W,4C] -> out [2H,2W,C], C % 8 == 0.
+// in(i, j, (2*di+dj)*C + c) -> out(2i+di, 2j+dj, c); with a 1x1 CONV to 4C this implements
+// ConvTranspose2d(k=2, s=2) exactly.
+__global__ void k_ps2(const __half* X, int xs, int xo, __half* Y, int ys, int yo,
+                      int H, int W, int C, int Bn) {           // C = OUTPUT channels
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  int Ho = H * 2, Wo = W * 2, cg = C >> 3;
+  if (idx >= Bn * Ho * Wo * cg) return;
+  int g = idx % cg, pix = idx / cg;
+  int c = g << 3;
+  int rem = pix % (Ho * Wo), brow = (pix / (Ho * Wo)) * H;
+  int ox = rem % Wo, oy = rem / Wo;
+  int q = ((oy & 1) << 1) | (ox & 1);
+  *(uint4*)(Y + (size_t)pix * ys + yo + c) =
+      *(const uint4*)(X + ((size_t)(brow + (oy >> 1)) * W + (ox >> 1)) * xs + xo + q * C + c);
+}
+
 __global__ void k_copyc(const __half* X, int xs, int xo, __half* Y, int ys, int yo, int HW, int C) {
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
   if (idx >= HW * C) return;
@@ -789,9 +838,14 @@ __global__ void k_attn(const __half* __restrict__ QKV, int qs, int qo,
   }
 }
 
-// DFL decode + score threshold. box view [H,W,64], cls view [H,W,80].
+// DFL decode + score threshold. box view [H,W,64], cls view [H,W,nc].
+// NM > 0 (segment): candidate records are 6+NM floats and the NM raw fp16 mask coefficients
+// at the same anchor are appended as fp32 (NM % 8 == 0, uint4 loads). NM == 0 dead-strips
+// the tail copy and keeps the detect codegen unchanged (MC/ms/mo unused).
+template <int NM>
 __global__ void k_decode(const __half* __restrict__ BOX, int bs, int bo,
                          const __half* __restrict__ CLS, int cs, int co,
+                         const __half* __restrict__ MC, int ms, int mo,
                          int H, int W, int stride, float conf,
                          float* __restrict__ out, int* __restrict__ cnt, int maxdet, int nc, int Bn) {
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -831,10 +885,20 @@ __global__ void k_decode(const __half* __restrict__ BOX, int bs, int bo,
   float cx = x + 0.5f, cy = y + 0.5f;
   int slot = atomicAdd(cnt + img, 1);
   if (slot >= maxdet) return;
-  float* o = out + ((size_t)img * maxdet + slot) * 6;
+  float* o = out + ((size_t)img * maxdet + slot) * (6 + NM);
   o[0] = (cx - d[0]) * stride; o[1] = (cy - d[1]) * stride;
   o[2] = (cx + d[2]) * stride; o[3] = (cy + d[3]) * stride;
   o[4] = score; o[5] = (float)bcls;
+  if (NM > 0) {
+    const __half* mp = MC + (size_t)idx * ms + mo;
+#pragma unroll
+    for (int i = 0; i < NM; i += 8) {
+      uint4 v = *(const uint4*)(mp + i);
+      const __half* h = (const __half*)&v;
+#pragma unroll
+      for (int j = 0; j < 8; j++) o[6 + i + j] = __half2float(h[j]);
+    }
+  }
 }
 
 // OBB decode: DFL + (sigmoid-0.25)*pi angle + dist2rbox. box view [H,W,64], cls view
@@ -978,10 +1042,14 @@ static ClsGeom clsGeom(int S, int sh, int sw) {
 }
 
 // single-block GPU NMS: bitonic sort by score, greedy suppression, compacted output.
+// cstride = candidate record stride (6 detect, 6+nm segment; only the first 6 floats are
+// read here); outidx0 records each survivor's candidate slot for post-NMS mask assembly.
 __global__ void k_nms(const float* __restrict__ cand0, const int* __restrict__ cnt0,
-                      float* __restrict__ out0, int* __restrict__ outcnt0, float thr, int maxdet) {
-  const float* cand = cand0 + (size_t)blockIdx.x * maxdet * 6;
+                      float* __restrict__ out0, int* __restrict__ outcnt0,
+                      int* __restrict__ outidx0, float thr, int maxdet, int cstride) {
+  const float* cand = cand0 + (size_t)blockIdx.x * maxdet * cstride;
   float* out = out0 + (size_t)blockIdx.x * MAX_OUT * 6;
+  int* outidx = outidx0 + (size_t)blockIdx.x * MAX_OUT;
   const int* cnt = cnt0 + blockIdx.x;
   int* outcnt = outcnt0 + blockIdx.x;
   __shared__ float bx1[NMS_CAP], by1[NMS_CAP], bx2[NMS_CAP], by2[NMS_CAP], bsc[NMS_CAP];
@@ -992,7 +1060,7 @@ __global__ void k_nms(const float* __restrict__ cand0, const int* __restrict__ c
   int n = min(*cnt, NMS_CAP);
   for (int i = tid; i < NMS_CAP; i += blockDim.x) {
     if (i < n) {
-      const float* c = cand + i * 6;
+      const float* c = cand + (size_t)i * cstride;
       bx1[i] = c[0]; by1[i] = c[1]; bx2[i] = c[2]; by2[i] = c[3];
       bsc[i] = c[4]; bcl[i] = (short)c[5]; dead[i] = 0;
     } else { bsc[i] = -1.f; dead[i] = 1; }
@@ -1043,9 +1111,45 @@ __global__ void k_nms(const float* __restrict__ cand0, const int* __restrict__ c
       float* d = out + m * 6;
       d[0] = bx1[o]; d[1] = by1[o]; d[2] = bx2[o]; d[3] = by2[o];
       d[4] = bsc[o]; d[5] = (float)bcl[o];
+      outidx[m] = o;   // order[] permutes slot indices, so o IS the candidate slot
       m++;
     }
     *outcnt = m;
+  }
+}
+
+// mask assembly for NMS survivors only: logits = coef . proto, crop to box (half-open float
+// compares, exactly ultralytics crop_mask), threshold logit > 0 (== sigmoid > 0.5). One block
+// per (survivor, image); fixed (MAX_OUT, Bn) grid + early exit captures into the CUDA graph.
+// rx/ry = proto/input resolution ratio (Pw/netW, Ph/netH).
+__global__ void k_mask_assemble(const __half* __restrict__ P, int ps, int po, int Ph, int Pw,
+                                int nm, const float* __restrict__ cand, int cstride, int maxdet,
+                                const int* __restrict__ outidx, const int* __restrict__ outcnt,
+                                const float* __restrict__ outdets,
+                                uint8_t* __restrict__ masks, float rx, float ry) {
+  int img = blockIdx.y, d = blockIdx.x;
+  if (d >= outcnt[img]) return;
+  const float* det = outdets + ((size_t)img * MAX_OUT + d) * 6;
+  int ci = outidx[img * MAX_OUT + d];
+  const float* cf = cand + ((size_t)img * maxdet + ci) * cstride + 6;
+  extern __shared__ float co[];                       // nm floats
+  if ((int)threadIdx.x < nm) co[threadIdx.x] = cf[threadIdx.x];
+  __syncthreads();
+  float bx1 = det[0] * rx, by1 = det[1] * ry, bx2 = det[2] * rx, by2 = det[3] * ry;
+  const __half* Pi = P + (size_t)img * Ph * Pw * ps;  // batch stride = rows * buffer stride
+  uint8_t* out = masks + ((size_t)img * MAX_OUT + d) * Ph * Pw;
+  for (int p = threadIdx.x; p < Ph * Pw; p += blockDim.x) {
+    int x = p % Pw, y = p / Pw;
+    const __half* pp = Pi + (size_t)p * ps + po;
+    float acc = 0.f;
+    for (int c = 0; c < nm; c += 8) {                 // nm % 8 == 0
+      uint4 v = *(const uint4*)(pp + c);
+      const __half* h = (const __half*)&v;
+#pragma unroll
+      for (int j = 0; j < 8; j++) acc += co[c + j] * __half2float(h[j]);
+    }
+    bool in = ((float)x >= bx1 && (float)x < bx2 && (float)y >= by1 && (float)y < by2);
+    out[p] = (in && acc > 0.f) ? 1 : 0;
   }
 }
 
@@ -1291,10 +1395,28 @@ static void runOp(Net& net, const Op& op, cudaStream_t st, int Bn) {
     case DECODE: {
       View b = view(net, op.a), c = view(net, op.b);
       int total = Bn * b.H * b.W;
-      k_decode<<<(total + TB - 1) / TB, TB, 0, st>>>(b.p, b.s, b.o, c.p, c.s, c.o,
+      k_decode<0><<<(total + TB - 1) / TB, TB, 0, st>>>(b.p, b.s, b.o, c.p, c.s, c.o,
+          nullptr, 0, 0,
           b.H, b.W, op.stride, 0.25f, net.dets, net.detcnt, Net::MAXDET, net.nc, Bn);
       break;
     }
+    case DECODESEG: {
+      View b = view(net, op.a), c = view(net, op.b), m = view(net, op.out);
+      int total = Bn * b.H * b.W;
+      k_decode<32><<<(total + TB - 1) / TB, TB, 0, st>>>(b.p, b.s, b.o, c.p, c.s, c.o,
+          m.p, m.s, m.o,
+          b.H, b.W, op.stride, 0.25f, net.dets, net.detcnt, Net::MAXDET, net.nc, Bn);
+      break;
+    }
+    case PS2: {
+      View x = view(net, op.a), y = view(net, op.out);
+      int total = Bn * y.H * y.W * (y.C / 8);
+      k_ps2<<<(total + TB - 1) / TB, TB, 0, st>>>(x.p, x.s, x.o, (__half*)y.p, y.s, y.o,
+                                                  x.H, x.W, y.C, Bn);
+      break;
+    }
+    case MASKS:   // declarative (proto tensor name); assembly runs post-NMS in forward()
+      break;
     case DECODEOBB: {
       View b = view(net, op.a), c = view(net, op.b), a = view(net, op.out);
       int total = Bn * b.H * b.W;
@@ -1332,7 +1454,16 @@ static void forward(Net& net, cudaStream_t st, int Bn) {
     k_nms_obb<<<Bn, 256, 0, st>>>(net.dets, net.detcnt, net.outdets, net.outcnt,
                                   net.nmsCov, 0.45f, Net::MAXDET);
   else
-    k_nms<<<Bn, 256, 0, st>>>(net.dets, net.detcnt, net.outdets, net.outcnt, 0.45f, Net::MAXDET);
+    k_nms<<<Bn, 256, 0, st>>>(net.dets, net.detcnt, net.outdets, net.outcnt, net.outidx,
+                              0.45f, Net::MAXDET, net.detStride);
+  if (net.protoTen >= 0) {   // segment: assemble survivor masks (device-resident; the D2H
+    // of B x 300 x Ph x Pw would cost ~0.3 ms/img — fetch on demand after sync instead)
+    View pr = view(net, net.protoTen);
+    k_mask_assemble<<<dim3(MAX_OUT, Bn), 256, net.nm * sizeof(float), st>>>(
+        pr.p, pr.s, pr.o, pr.H, pr.W, net.nm, net.dets, net.detStride, Net::MAXDET,
+        net.outidx, net.outcnt, net.outdets, net.masks,
+        (float)pr.W / net.inW, (float)pr.H / net.inH);
+  }
   CK(cudaMemcpyAsync(net.h_rawcnt, net.detcnt, Bn * sizeof(int), cudaMemcpyDeviceToHost, st));
   CK(cudaMemcpyAsync(net.h_cnt, net.outcnt, Bn * sizeof(int), cudaMemcpyDeviceToHost, st));
   CK(cudaMemcpyAsync(net.h_out, net.outdets, (size_t)Bn * 300 * net.detK() * sizeof(float), cudaMemcpyDeviceToHost, st));
@@ -1494,7 +1625,8 @@ static void usage() {
   printf("yolo11cuda — hand-written CUDA inference engine for YOLO11\n\n"
          "usage: yolo11cuda <mode> [model-dir] [iters] [--image path] [--batch N]\n\n"
          "modes:\n"
-         "  detect    run one inference, print detections (--image for any jpg/png)\n"
+         "  detect    run one inference, print detections (--image for any jpg/png;\n"
+         "            segment: --save-masks writes gpu/masks.u8 + gpu/dets.f32, image 0 only)\n"
          "  bench     net-only benchmark (stream vs CUDA graph)\n"
          "  pipeline  end-to-end benchmark: H2D + preprocess + net + decode + NMS\n"
          "  profile   per-op timing breakdown\n"
@@ -1550,7 +1682,7 @@ extern "C" void* yolo_create(const char* model_dir, int max_batch) {
 
 extern "C" int yolo_task(void* p) {
   const Net& n = ((YoloHandle*)p)->net;
-  return n.obb ? 1 : (n.cls ? 2 : 0);
+  return n.seg ? 3 : (n.obb ? 1 : (n.cls ? 2 : 0));
 }
 extern "C" float yolo_exec_ms(void* p, int B) { return ((YoloHandle*)p)->execMs[B - 1]; }
 extern "C" cudaStream_t yolo_stream(void* p) { return ((YoloHandle*)p)->st; }
@@ -1592,6 +1724,23 @@ extern "C" int yolo_get(void* p, int slot, YoloDet* out, int cap) {
   return cnt;
 }
 
+extern "C" void yolo_mask_dim(void* p, int* ph, int* pw) {
+  const Net& n = ((YoloHandle*)p)->net;
+  if (n.protoTen < 0) { *ph = *pw = 0; return; }
+  const Buf& b = n.bufs[n.tens[n.protoTen].buf];
+  *ph = b.H; *pw = b.W;
+}
+
+extern "C" int yolo_get_mask(void* p, int slot, int det, unsigned char* out) {
+  auto* h = (YoloHandle*)p;
+  const Net& n = h->net;
+  if (n.protoTen < 0 || det < 0 || det >= n.h_cnt[slot]) return -1;
+  const Buf& b = n.bufs[n.tens[n.protoTen].buf];
+  size_t sz = (size_t)b.H * b.W;
+  CK(cudaMemcpy(out, n.masks + ((size_t)slot * MAX_OUT + det) * sz, sz, cudaMemcpyDeviceToHost));
+  return 0;
+}
+
 extern "C" int yolo_get_obb(void* p, int slot, YoloObbDet* out, int cap) {
   auto* h = (YoloHandle*)p;
   const auto& sm = h->slots[slot];
@@ -1613,10 +1762,12 @@ int main(int argc, char** argv) {
   int iterArg = -1;
   std::string image;
   int batch = 1;
+  bool saveMasks = false;
   for (int i = 2; i < argc; i++) {
     std::string a = argv[i];
     if (a == "--image" && i + 1 < argc) image = argv[++i];
     else if (a == "--batch" && i + 1 < argc) batch = atoi(argv[++i]);
+    else if (a == "--save-masks") saveMasks = true;
     else if (a == "-h" || a == "--help") { usage(); return 0; }
     else if (a[0] >= '0' && a[0] <= '9') iterArg = atoi(a.c_str());
     else dir = a;
@@ -1658,7 +1809,8 @@ int main(int argc, char** argv) {
       CK(cudaStreamSynchronize(st));
       CK(cudaGetLastError());
       const Op& op = net.ops[k];
-      if (op.kind == DECODE || op.kind == DECODEOBB) continue;
+      if (op.kind == DECODE || op.kind == DECODEOBB || op.kind == DECODESEG ||
+          op.kind == MASKS) continue;
       View y = view(net, op.out);
       // copy strided view to contiguous host
       std::vector<__half> host((size_t)y.H * y.W * y.C);
@@ -1727,16 +1879,60 @@ int main(int argc, char** argv) {
       bool same = true;
       for (int b = 0; b < net.B; b++) { printf(" %d", net.h_cnt[b]); same &= net.h_cnt[b] == net.h_cnt[0]; }
       printf("  %s\n", same ? "(consistent)" : "(MISMATCH!)");
+      if (net.protoTen >= 0) {   // segment: total mask pixels must match across the batch too
+        View pr = view(net, net.protoTen);
+        size_t msz = (size_t)pr.H * pr.W;
+        printf("batch=%d per-image mask px:", net.B);
+        long a0 = 0; bool msame = true;
+        for (int b = 0; b < net.B; b++) {
+          std::vector<uint8_t> tmp((size_t)net.h_cnt[b] * msz);
+          if (!tmp.empty())
+            CK(cudaMemcpy(tmp.data(), net.masks + (size_t)b * MAX_OUT * msz, tmp.size(),
+                          cudaMemcpyDeviceToHost));
+          long a = 0; for (uint8_t v : tmp) a += v;
+          if (b == 0) a0 = a;
+          msame &= a == a0;
+          printf(" %ld", a);
+        }
+        printf("  %s\n", msame ? "(consistent)" : "(MISMATCH!)");
+      }
     }
     if (net.obb) {     // rotated boxes, mapped back to original image coordinates
       printObb(fetchNMSObb(net), scale, top, left);
     } else {
       auto keep = fetchNMS(net);
       printf("kept=%zu%s\n", keep.size(), image.empty() ? "" : "  (boxes in original image coords)");
-      for (auto& d : keep)   // map back to original image coordinates when letterboxed
-        printf("cls=%2d score=%.4f box=(%.1f, %.1f, %.1f, %.1f)\n", d.cls, d.sc,
+      int Ph = 0, Pw = 0;
+      std::vector<uint8_t> mh;   // segment: image-0 survivor masks (contiguous in output order)
+      if (net.protoTen >= 0 && !keep.empty()) {
+        View pr = view(net, net.protoTen);
+        Ph = pr.H; Pw = pr.W;
+        mh.resize(keep.size() * (size_t)Ph * Pw);
+        CK(cudaMemcpy(mh.data(), net.masks, mh.size(), cudaMemcpyDeviceToHost));
+      }
+      for (size_t i = 0; i < keep.size(); i++) {   // map back to original coords when letterboxed
+        const Det& d = keep[i];
+        printf("cls=%2d score=%.4f box=(%.1f, %.1f, %.1f, %.1f)", d.cls, d.sc,
                (d.x1 - left) / scale, (d.y1 - top) / scale,
                (d.x2 - left) / scale, (d.y2 - top) / scale);
+        if (!mh.empty()) {
+          int area = 0;
+          const uint8_t* mp = mh.data() + i * (size_t)Ph * Pw;
+          for (int p = 0; p < Ph * Pw; p++) area += mp[p];
+          printf("  mask=%d/%dpx", area, Ph * Pw);
+        }
+        printf("\n");
+      }
+      if (saveMasks && net.protoTen >= 0) {   // for test/compare_seg.py (letterbox 640-space dets;
+                                              // image-0 masks/dets only when --batch > 1)
+        if (system(("mkdir -p " + dir + "/gpu").c_str()) != 0)
+          fprintf(stderr, "mkdir %s/gpu failed\n", dir.c_str());
+        FILE* f = fopen((dir + "/gpu/masks.u8").c_str(), "wb");
+        fwrite(mh.data(), 1, mh.size(), f); fclose(f);
+        f = fopen((dir + "/gpu/dets.f32").c_str(), "wb");
+        fwrite(net.h_out, sizeof(float), keep.size() * 6, f); fclose(f);
+        printf("wrote %s/gpu/masks.u8 (%zu x %dx%d) + dets.f32\n", dir.c_str(), keep.size(), Ph, Pw);
+      }
     }
   } else if (mode == "pipeline") {
     // full pipeline: pinned H2D (raw BGR u8) -> GPU letterbox/normalize -> net -> decode -> GPU NMS
@@ -1818,7 +2014,7 @@ int main(int argc, char** argv) {
       }
     }
     const char* names[] = {"CONV", "ADD", "MAXPOOL5", "UPSAMPLE2", "COPYC", "ATTN", "DECODE",
-                           "GAP", "SOFTMAX", "DECODEOBB"};
+                           "GAP", "SOFTMAX", "DECODEOBB", "PS2", "DECODESEG", "MASKS"};
     std::vector<int> order(net.ops.size());
     for (size_t i = 0; i < order.size(); i++) order[i] = i;
     std::sort(order.begin(), order.end(), [&](int a, int b) { return acc[a] > acc[b]; });
@@ -1827,7 +2023,8 @@ int main(int argc, char** argv) {
     for (int i = 0; i < 25 && i < (int)order.size(); i++) {
       int k = order[i];
       const Op& op = net.ops[k];
-      View y = view(net, op.kind == DECODE || op.kind == DECODEOBB ? op.a : op.out);
+      View y = view(net, op.kind == DECODE || op.kind == DECODEOBB || op.kind == DECODESEG ||
+                         op.kind == MASKS ? op.a : op.out);   // MASKS has out == -1
       printf("op%03d %-9s %4dx%-4d Cin=%-3d Cout=%-3d k=%d s=%d g=%d res=%d  %7.1f us  (%4.1f%%)\n",
              k, names[op.kind], y.H, y.W, op.Cin, op.Cout, op.k, op.s, op.g, op.b >= 0 && op.kind == CONV,
              acc[k] / iters * 1000.f, 100.f * acc[k] / tot);

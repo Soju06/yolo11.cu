@@ -19,6 +19,11 @@ test: $(BIN)
 	python3 test/compare.py build/$(MODEL)
 	./$(BIN) detect build/$(MODEL)
 
+# segment end-to-end mask gate vs ultralytics (docs/specs/seg.md 5.3); MODEL=yolo11n-seg etc.
+test-seg: $(BIN)
+	./$(BIN) detect build/$(MODEL) --save-masks
+	python3 test/compare_seg.py build/$(MODEL)
+
 bench: $(BIN)
 	./$(BIN) bench build/$(MODEL) 300
 	./$(BIN) pipeline build/$(MODEL) 300
@@ -41,4 +46,4 @@ yolo11serve: server/serve.cpp server/yolo.pb.cc server/yolo.grpc.pb.cc engine_li
 	  -L/usr/local/cuda/lib64 -lcudart -lnvjpeg -lgrpc++ -lgrpc -lgpr -labsl_synchronization -lprotobuf -lpthread \
 	  -o yolo11serve
 
-.PHONY: all export test bench serve clean
+.PHONY: all export test test-seg bench serve clean

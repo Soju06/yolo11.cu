@@ -139,6 +139,29 @@ class Graph:
         assert self.shape(out) == (H * 2, W * 2, C)
         self.ops.append(('UPSAMPLE2', x, out)); return out
 
+    def ps2(self, x, out):
+        """pixel shuffle r=2 from quadrant channel blocks: [H,W,4C] -> [2H,2W,C]"""
+        H, W, C4 = self.shape(x)
+        assert self.shape(out) == (H * 2, W * 2, C4 // 4)
+        self.ops.append(('PS2', x, out)); return out
+
+    def conv_transpose2(self, x, mod, out=None):
+        """ConvTranspose2d(C->C, k=2, s=2, p=0) == 1x1 CONV to 4C (q-major quadrant
+        blocks, q = 2*di+dj -> row q*C+o; %8-aligned block starts) + PS2. Exact linear
+        algebra: w1x1[q*C+o, c] = Wt[c, o, di, dj] (torch layout is [Cin, Cout, kh, kw])."""
+        H, W, Cin = self.shape(x)
+        wt = mod.weight.detach()
+        C = wt.shape[1]
+        assert tuple(wt.shape) == (Cin, C, 2, 2) and mod.stride[0] == 2 and mod.padding[0] == 0
+        w = wt.permute(2, 3, 1, 0).reshape(4 * C, 1, 1, Cin).numpy()   # OHWI rows q*C+o
+        b = np.tile(mod.bias.detach().numpy(), 4)                      # [4C], q-major tiling
+        woff, boff = self.add_weight(w, b)
+        up4 = self.newt(H, W, 4 * C)
+        self.ops.append(('CONV', x, up4, 1, 1, 0, 1, ACT_NONE, Cin, 4 * C, woff, boff))
+        if out is None:
+            out = self.newt(H * 2, W * 2, C)
+        return self.ps2(up4, out)
+
     def copyc(self, x, out):
         assert self.shape(x) == self.shape(out)
         self.ops.append(('COPYC', x, out)); return out
@@ -151,6 +174,9 @@ class Graph:
 
     def decode_obb(self, box, cls, ang, stride):
         self.ops.append(('DECODEOBB', box, cls, ang, stride))
+
+    def decode_seg(self, box, cls, coef, stride):
+        self.ops.append(('DECODESEG', box, cls, coef, stride))
 
     def gap(self, x, out):
         H, W, C = self.shape(x)
@@ -311,13 +337,23 @@ def build(net, g, S):
     t21 = g.ten(cat21, 0, c20 + c10); g.layer_out[21] = t21
     l22 = c3k2(g, t21, net[22]); outs[22] = l22; g.layer_out[22] = l22   # S/32 (P5)
 
-    # Detect / OBB head
+    # Detect / OBB / Segment head
     det = net[len(net) - 1]
     assert torch.allclose(det.dfl.conv.weight.view(-1), torch.arange(16, dtype=torch.float32))
     obb = isinstance(det, uhead.OBB)
+    seg = isinstance(det, uhead.Segment)
     feats = [l16, l19, l22]
     strides = [8, 16, 32]
     g.det_ref = []
+    if seg:
+        # Proto on P3: cv1 (3x3 SiLU) -> ConvTranspose2d as 1x1 CONV + PS2 -> cv2 (3x3
+        # SiLU) -> cv3 (1x1 SiLU, unlike the bare-Conv2d head finals) -> [2S/8, 2S/8, nm]
+        assert det.nm % 8 == 0
+        t = g.conv(l16, det.proto.cv1)
+        t = g.conv_transpose2(t, det.proto.upsample)
+        t = g.conv(t, det.proto.cv2)
+        t_proto = g.conv(t, det.proto.cv3)
+        g.seg_ref = {'proto': t_proto, 'cv4': []}
     for i, (f, st) in enumerate(zip(feats, strides)):
         b = f
         for m_ in det.cv2[i]:
@@ -336,10 +372,20 @@ def build(net, g, S):
             a = g.conv_pad(a, det.cv4[i][2], (det.ne + 7) // 8 * 8)
             g.decode_obb(b, c, a, st)
             g.det_ref.append((b, c, a))
+        elif seg:
+            c = g.conv(c, det.cv3[i][2])
+            mc = f
+            for m_ in det.cv4[i]:              # 3x3 SiLU, 3x3 SiLU, 1x1 no-act -> nm
+                mc = g.conv(mc, m_)
+            g.decode_seg(b, c, mc, st)
+            g.seg_ref['cv4'].append(mc)
+            g.det_ref.append((b, c, mc))
         else:
             c = g.conv(c, det.cv3[i][2])
             g.decode(b, c, st)
             g.det_ref.append((b, c))
+    if seg:
+        g.ops.append(('MASKS', t_proto))       # last op: engine assembles masks post-NMS
     return g
 
 def build_cls(net, g, S):
@@ -404,6 +450,15 @@ def run_reference(g, x_nchw, dump=True, fp32_weights=False, round_fp16=False):
             _, x, out = op; wr(out, F.max_pool2d(rd(x)[None], 5, 1, 2)[0])
         elif kind == 'UPSAMPLE2':
             _, x, out = op; wr(out, F.interpolate(rd(x)[None], scale_factor=2, mode='nearest')[0])
+        elif kind == 'PS2':
+            _, x, out = op
+            v = rd(x); C = v.shape[0] // 4; H, W = v.shape[1:]
+            y = torch.zeros(C, 2 * H, 2 * W)
+            for di in range(2):
+                for dj in range(2):
+                    q = 2 * di + dj
+                    y[:, di::2, dj::2] = v[q * C:(q + 1) * C]
+            wr(out, y)
         elif kind == 'COPYC':
             _, x, out = op; wr(out, rd(x))
         elif kind == 'ATTN':
@@ -427,6 +482,12 @@ def run_reference(g, x_nchw, dump=True, fp32_weights=False, round_fp16=False):
             _, box, cls, ang, st = op
             dets.append((rd(box).clone(), rd(cls).clone(), rd(ang).clone(), st))
             continue
+        elif kind == 'DECODESEG':
+            _, box, cls, coef, st = op
+            dets.append((rd(box).clone(), rd(cls).clone(), rd(coef).clone(), st))
+            continue
+        elif kind == 'MASKS':
+            continue    # declarative: names the proto tensor for the engine
         else:
             raise RuntimeError(kind)
         if dump:
@@ -500,6 +561,8 @@ def main():
         task = 'classify'
     elif isinstance(net[-1], uhead.OBB):
         task = 'obb'
+    elif isinstance(net[-1], uhead.Segment):
+        task = 'segment'
     else:
         task = 'detect'
     # cls checkpoints carry a stale detect nc=80 in model.yaml; the linear layer is the truth
@@ -544,11 +607,22 @@ def main():
     # ultralytics reference with hooks (classify: incl. the head; detect: 0..22, head via final)
     nhook = len(net) if task == 'classify' else len(net) - 1
     caps = {}
+    segcaps = {}
     hooks = []
     for i in range(nhook):
         hooks.append(net[i].register_forward_hook(lambda mo, inp, out, i=i: caps.__setitem__(i, out)))
+    if task == 'segment':   # head-internal hooks: Proto output and cv4 coefficient maps
+        hooks.append(net[-1].proto.register_forward_hook(
+            lambda mo, inp, out: segcaps.__setitem__('proto', out)))
+        for j in range(len(net[-1].cv4)):
+            hooks.append(net[-1].cv4[j].register_forward_hook(
+                lambda mo, inp, out, j=j: segcaps.__setitem__(f'cv4[{j}]', out)))
     y = model(x)
     y = y[0] if isinstance(y, (tuple, list)) else y
+    if task == 'segment':   # segment forward is ((y, proto), preds): unpack once more
+        y, proto_ref = y
+        np.save(BUILD + '/ref/proto.npy', proto_ref.numpy())
+        print('ultralytics proto:', tuple(proto_ref.shape))
     for h in hooks: h.remove()
     np.save(BUILD + '/ref/final.npy', y.numpy())
     print('ultralytics final:', tuple(y.shape))
@@ -571,6 +645,14 @@ def main():
         d = (mine.reshape(-1) - refv.reshape(-1)).abs().max().item()
         worst = max(worst, d)
         print(f'layer {i:2d}: {d:.3e}')
+    if task == 'segment':   # head-internal tensors: proto (incl. the ConvTranspose->CONV+PS2
+        # rewrite) and the three cv4 coefficient maps, same fp32 gate as layers 0..22
+        for name, t in [('proto', g.seg_ref['proto'])] + \
+                       [(f'cv4[{j}]', t) for j, t in enumerate(g.seg_ref['cv4'])]:
+            b, coff, C = g.tens[t]
+            d = (bufs[b][coff:coff + C].reshape(-1) - segcaps[name].reshape(-1)).abs().max().item()
+            worst = max(worst, d)
+            print(f'{name}: {d:.3e}')
     print('WORST', worst)
     # accumulation-order noise grows with resolution (measured worst: 3.5e-5 @320,
     # 8.7e-5 @640, 2.07e-4 @1024 — tracks pixel count, x2.4 for x2.56 pixels), so the

@@ -9,10 +9,10 @@ typedef struct { float x, y, w, h, angle, score; int cls; } YoloObbDet;
 
 // Load model dir, fuse, autotune, build+calibrate CUDA graphs for B = 1..max_batch.
 void* yolo_create(const char* model_dir, int max_batch);
-// Task of the loaded model: 0 = detect, 1 = obb, 2 = classify. Check this before fetching:
-// yolo_get is valid only on detect handles and yolo_get_obb only on obb handles — the wrong
-// getter reads the result buffer at the wrong record stride and returns garbage; classify
-// results are not exposed through this API at all.
+// Task of the loaded model: 0 = detect, 1 = obb, 2 = classify, 3 = segment. Check this
+// before fetching: yolo_get is valid only on detect/segment handles and yolo_get_obb only
+// on obb handles — the wrong getter reads the result buffer at the wrong record stride and
+// returns garbage; classify results are not exposed through this API at all.
 int yolo_task(void* h);
 // Calibrated GPU latency (ms) of a full batch-B forward (net + decode + NMS + D2H).
 float yolo_exec_ms(void* h, int B);
@@ -31,5 +31,13 @@ int yolo_get(void* h, int slot, YoloDet* out, int cap);
 // OBB variant: rotated boxes (center xy, wh, angle in radians), original image coords
 // (angle unchanged, no clipping — matches ultralytics scale_boxes(xywh=True)).
 int yolo_get_obb(void* h, int slot, YoloObbDet* out, int cap);
+// Segment mask dimensions (proto resolution, i.e. imgsz/4; 0/0 for non-segment models).
+void yolo_mask_dim(void* h, int* ph, int* pw);
+// Binary u8 {0,1} mask of detection `det` of slot `slot` (out: ph*pw bytes; call after
+// yolo_run/yolo_sync). Masks are box-cropped, thresholded at proto resolution; mask pixel
+// (mx,my) covers letterbox pixels [4mx,4mx+4)x[4my,4my+4) — mapping to original image
+// coords (subtract pad, divide by scale) is the caller's job. Returns 0, or -1 if det is
+// out of range or the model has no masks.
+int yolo_get_mask(void* h, int slot, int det, unsigned char* out);
 
 }  // extern "C"
