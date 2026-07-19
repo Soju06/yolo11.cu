@@ -146,11 +146,12 @@ static void loadGraph(Net& net, const std::string& dir) {
   if (net.inH && (net.inH != ib0.H || net.inW != ib0.W)) { fprintf(stderr, "imgsz header mismatch\n"); exit(1); }
   net.inH = ib0.H; net.inW = ib0.W;
 
-  // fail fast on the class-count invariants k_decode relies on (vec8 cls loads, cls view
-  // width == nc); the obb/cls specs own lifting nc % 8
+  // fail fast on the class-count invariants k_decode relies on (vec8 cls loads over an
+  // 8-aligned cls view; fine-tuned heads with nc % 8 != 0 are zero-padded at export)
   for (const Op& op : net.ops)
-    if (op.kind == DECODE && (net.nc % 8 || net.tens[op.b].C != net.nc)) {
-      fprintf(stderr, "DECODE needs nc %% 8 == 0 and cls view C == nc (nc=%d, C=%d)\n",
+    if ((op.kind == DECODE || op.kind == DECODESEG) &&
+        (net.tens[op.b].C % 8 || net.tens[op.b].C < net.nc)) {
+      fprintf(stderr, "DECODE needs an 8-aligned cls view covering nc (nc=%d, C=%d)\n",
               net.nc, net.tens[op.b].C); exit(1);
     }
 
@@ -849,20 +850,21 @@ __global__ void k_decode(const __half* __restrict__ BOX, int bs, int bo,
                          const __half* __restrict__ CLS, int cs, int co,
                          const __half* __restrict__ MC, int ms, int mo,
                          int H, int W, int stride, float conf,
-                         float* __restrict__ out, int* __restrict__ cnt, int maxdet, int nc, int Bn) {
+                         float* __restrict__ out, int* __restrict__ cnt, int maxdet, int nc, int ncpad, int Bn) {
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
   if (idx >= Bn * H * W) return;
   int img = idx / (H * W), rem = idx % (H * W);
   int x = rem % W, y = rem / W;
   const __half* cp = CLS + (size_t)idx * cs + co;
   float best = -1e30f; int bcls = 0;
-  for (int c0 = 0; c0 < nc; c0 += 8) {         // nc % 8 == 0 (80)
+  for (int c0 = 0; c0 < ncpad; c0 += 8) {
     uint4 v = *(const uint4*)(cp + c0);
     const __half* h = (const __half*)&v;
 #pragma unroll
     for (int i = 0; i < 8; i++) {
       float f = __half2float(h[i]);
-      if (f > best) { best = f; bcls = c0 + i; }
+      // pad logits are exactly 0 (sigmoid 0.5): keep them out of the argmax
+      if (c0 + i < nc && f > best) { best = f; bcls = c0 + i; }
     }
   }
   float score = 1.f / (1.f + expf(-best));
@@ -1406,7 +1408,7 @@ static void runOp(Net& net, const Op& op, cudaStream_t st, int Bn) {
       int total = Bn * b.H * b.W;
       k_decode<0><<<(total + TB - 1) / TB, TB, 0, st>>>(b.p, b.s, b.o, c.p, c.s, c.o,
           nullptr, 0, 0,
-          b.H, b.W, op.stride, 0.25f, net.dets, net.detcnt, Net::MAXDET, net.nc, Bn);
+          b.H, b.W, op.stride, 0.25f, net.dets, net.detcnt, Net::MAXDET, net.nc, c.C, Bn);
       break;
     }
     case DECODESEG: {
@@ -1414,7 +1416,7 @@ static void runOp(Net& net, const Op& op, cudaStream_t st, int Bn) {
       int total = Bn * b.H * b.W;
       k_decode<32><<<(total + TB - 1) / TB, TB, 0, st>>>(b.p, b.s, b.o, c.p, c.s, c.o,
           m.p, m.s, m.o,
-          b.H, b.W, op.stride, 0.25f, net.dets, net.detcnt, Net::MAXDET, net.nc, Bn);
+          b.H, b.W, op.stride, 0.25f, net.dets, net.detcnt, Net::MAXDET, net.nc, c.C, Bn);
       break;
     }
     case PS2: {

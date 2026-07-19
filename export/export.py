@@ -398,22 +398,21 @@ def build(net, g, S):
     for i, (f, st) in enumerate(zip(feats, strides)):
         b = emit_chain(g, f, det.cv2[i])
         c = emit_chain(g, f, det.cv3[i][:2])
+        # final cls/angle Couts may not be %8 (obb nc=15/ne=1, fine-tuned detect heads):
+        # zero-pad (k_conv_mma's half2 epilogue crashes on odd Cout); the decode kernels
+        # only consider the real channels. No-op when nc is already aligned (COCO 80).
+        c = g.conv_pad(c, det.cv3[i][2], (det.nc + 7) // 8 * 8)
         if obb:
-            # final cv3/cv4 Couts (nc=15, ne=1) are not %8: zero-pad (k_conv_mma's half2
-            # epilogue crashes on odd Cout); the decode kernel reads only the real channels
-            c = g.conv_pad(c, det.cv3[i][2], (det.nc + 7) // 8 * 8)
             a = emit_chain(g, f, det.cv4[i][:2])
             a = g.conv_pad(a, det.cv4[i][2], (det.ne + 7) // 8 * 8)
             g.decode_obb(b, c, a, st)
             g.det_ref.append((b, c, a))
         elif seg:
-            c = g.conv(c, det.cv3[i][2])
             mc = emit_chain(g, f, det.cv4[i])  # 3x3 SiLU, 3x3 SiLU, 1x1 no-act -> nm
             g.decode_seg(b, c, mc, st)
             g.seg_ref['cv4'].append(mc)
             g.det_ref.append((b, c, mc))
         else:
-            c = g.conv(c, det.cv3[i][2])
             g.decode(b, c, st)
             g.det_ref.append((b, c))
     if seg:

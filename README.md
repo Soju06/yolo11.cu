@@ -63,7 +63,9 @@ end-to-end pipeline (H2D + preprocess + net + decode + NMS): 1.13 ms/frame (888 
 Any ultralytics YOLOv8/YOLO11 checkpoint works the same way: `make export MODEL=yolov8s`,
 `MODEL=yolo11l`, `MODEL=yolov8n-seg`… The exporter is a generic topology walker over the model's
 own layer graph — channel widths, block repeats, attention heads, task heads are all read off the
-checkpoint, so scales and task variants compose with zero per-model code.
+checkpoint, so scales and task variants compose with zero per-model code. Fine-tuned checkpoints
+with custom class counts work too: heads whose class logits aren't 8-aligned are zero-padded at
+export (the conv epilogue needs %8 channels) and the decode kernels ignore the pad channels.
 
 ## Not just detection
 
