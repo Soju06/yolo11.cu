@@ -64,8 +64,9 @@ Any ultralytics YOLOv8/YOLO11 checkpoint works the same way: `make export MODEL=
 `MODEL=yolo11l`, `MODEL=yolov8n-seg`… The exporter is a generic topology walker over the model's
 own layer graph — channel widths, block repeats, attention heads, task heads are all read off the
 checkpoint, so scales and task variants compose with zero per-model code. Fine-tuned checkpoints
-with custom class counts work too: heads whose class logits aren't 8-aligned are zero-padded at
-export (the conv epilogue needs %8 channels) and the decode kernels ignore the pad channels.
+with custom class counts work too: the cls branch — whose width tracks nc in the ultralytics
+heads — is zero-padded to 8-aligned channels at every stage (the conv kernels need %8 widths)
+and the decode kernels ignore the pad channels.
 
 ## Not just detection
 

@@ -171,9 +171,9 @@ static void loadGraph(Net& net, const std::string& dir) {
     if (op.kind == MASKS) { net.protoTen = op.a; net.nm = net.tens[op.a].C; }
   for (const Op& op : net.ops)
     if (op.kind == DECODESEG &&
-        (!net.seg || net.protoTen < 0 || net.nc % 8 || net.tens[op.b].C != net.nc ||
+        (!net.seg || net.protoTen < 0 ||   // cls view invariants are checked above
          net.tens[op.out].C != net.nm || net.nm != 32)) {   // k_decode<32> is the only NM inst.
-      fprintf(stderr, "DECODESEG needs task=segment, a MASKS op, nc %% 8 == 0 and nm == 32 "
+      fprintf(stderr, "DECODESEG needs task=segment, a MASKS op and nm == 32 "
               "(nc=%d nm=%d coef C=%d)\n", net.nc, net.nm, net.tens[op.out].C); exit(1);
     }
   net.detStride = net.obb ? 7 : 6 + net.nm;

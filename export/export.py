@@ -106,24 +106,42 @@ class Graph:
         self.ops.append(('CONV', x, out, k, s, p, g, a, Cin, O, woff, boff))
         return out
 
-    def conv_pad(self, x, conv, cpad, act=ACT_NONE):
-        """plain nn.Conv2d, output channels zero-padded to cpad (pad rows: w=0, b=0).
-        The k_conv_mma half2 epilogue makes unaligned Cout illegal; consumers read
-        only the real channels (pad = exact zero logits on both sides of compare).
-        O == cpad (already aligned, e.g. a custom obb head with nc % 8 == 0) is
-        allowed and degenerates to a plain conv."""
+    def conv_pad(self, x, mod, cpad=None, act=None):
+        """conv with channels zero-padded to 8-alignment. k_conv_mma's vec8 A-tile
+        loads make unaligned input C illegal and its half2 epilogue crashes on odd
+        Cout, so a chain whose widths track nc (detect cls heads: c3 = max(64,
+        min(nc,100))) must be padded end to end. Pad output rows are w=0, b=0 —
+        with SiLU (act(0)=0) or no activation the pad channels stay exactly 0, so
+        a padded consumer's extra input columns (also w=0) contribute nothing and
+        every real channel matches the unpadded model bit for bit. cpad defaults
+        to ceil8(O); already-aligned convs degenerate to plain g.conv emission."""
+        if isinstance(mod, uconv.Conv):
+            conv, a = mod.conv, ACT_SILU if isinstance(mod.act, nn.SiLU) else ACT_NONE
+        else:
+            conv, a = mod, ACT_NONE
+        if act is not None:
+            a = act
         O, Ig, kh, kw = conv.weight.shape
-        assert conv.groups == 1 and O <= cpad and cpad % 8 == 0
-        k, s, p = kh, conv.stride[0], conv.padding[0]
+        if cpad is None:
+            cpad = (O + 7) // 8 * 8
         H, W, Cin = self.shape(x)
+        dw = conv.groups > 1
+        assert (conv.groups == 1 or (conv.groups == O == Ig * conv.groups)) \
+            and O <= cpad and cpad % 8 == 0 and Ig * conv.groups <= Cin
+        if O == cpad and Ig * conv.groups == Cin:   # aligned, unpadded input: plain conv
+            return self.conv(x, mod, act=act)
+        k, s, p = kh, conv.stride[0], conv.padding[0]
         Ho, Wo = (H + 2 * p - k) // s + 1, (W + 2 * p - k) // s + 1
         out = self.newt(Ho, Wo, cpad)
         w = conv.weight.detach().permute(0, 2, 3, 1).contiguous().numpy()  # OHWI
-        w = np.concatenate([w, np.zeros((cpad - O, kh, kw, Ig), w.dtype)], 0)
+        if not dw and Ig < Cin:   # input was padded: dead columns for the zero channels
+            w = np.concatenate([w, np.zeros((O, kh, kw, Cin - Ig), w.dtype)], 3)
+        w = np.concatenate([w, np.zeros((cpad - O, kh, kw, w.shape[3]), w.dtype)], 0)
         bias = conv.bias.detach().numpy() if conv.bias is not None else np.zeros(O, np.float32)
         b = np.concatenate([bias, np.zeros(cpad - O, np.float32)])
         woff, boff = self.add_weight(w, b)
-        self.ops.append(('CONV', x, out, k, s, p, 1, act, Cin, cpad, woff, boff))
+        self.ops.append(('CONV', x, out, k, s, p, cpad if dw else 1, a, cpad if dw else Cin,
+                         cpad, woff, boff))
         return out
 
     def add(self, a, b, out):
@@ -287,14 +305,15 @@ def c2psa(g, x, mod, out=None):
 
 # ---------------- build the network graph ----------------
 
-def emit_chain(g, x, mod):
+def emit_chain(g, x, mod, pad8=False):
     """Emit a conv chain, flattening (possibly nested) Sequentials — handles both
-    yolov8's flat head branches and yolo11's DWConv-nested ones."""
+    yolov8's flat head branches and yolo11's DWConv-nested ones. pad8 keeps every
+    stage 8-aligned (no-op on aligned widths) for chains whose width tracks nc."""
     if isinstance(mod, nn.Sequential):
         for m_ in mod:
-            x = emit_chain(g, x, m_)
+            x = emit_chain(g, x, m_, pad8)
         return x
-    return g.conv(x, mod)
+    return g.conv_pad(x, mod) if pad8 else g.conv(x, mod)
 
 
 def build(net, g, S):
@@ -397,7 +416,9 @@ def build(net, g, S):
         g.seg_ref = {'proto': t_proto, 'cv4': []}
     for i, (f, st) in enumerate(zip(feats, strides)):
         b = emit_chain(g, f, det.cv2[i])
-        c = emit_chain(g, f, det.cv3[i][:2])
+        # cls-branch widths track nc (c3 = max(64, min(nc,100)) on the n scale), so
+        # fine-tuned heads with nc > 64 go unaligned mid-chain: pad every stage
+        c = emit_chain(g, f, det.cv3[i][:2], pad8=True)
         # final cls/angle Couts may not be %8 (obb nc=15/ne=1, fine-tuned detect heads):
         # zero-pad (k_conv_mma's half2 epilogue crashes on odd Cout); the decode kernels
         # only consider the real channels. No-op when nc is already aligned (COCO 80).
